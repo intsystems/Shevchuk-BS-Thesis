@@ -2,6 +2,8 @@
 \usepackage{openwork}
 \usepackage{amssymb}
 \usepackage[english,russian]{babel}
+\usepackage{cite}
+\usepackage[hidelinks]{hyperref} 
 
 \title{Analysis of the Relationship Between Electroencephalography (EEG) and
 Functional Magnetic Resonance Imaging (fMRI) Signals}
@@ -14,7 +16,7 @@ Functional Magnetic Resonance Imaging (fMRI) Signals}
 \date{}
 
 \begin{document}
-
+\hypersetup{final}
 \maketitle
 
 \begin{abstract}
@@ -22,7 +24,7 @@ Functional Magnetic Resonance Imaging (fMRI) Signals}
 
 Цель данной статьи - проанализировать взаимосвязь между ЭЭГ и фМРТ путём кодирования данных обоих методов в общее латентное пространство, а также применить статистические тесты для исследования их взаимной зависимости.
 
-\textbf{Keywords:} Brain, EEG, fMRI, contrastive learning, neural network
+\textbf{Ключевые слова:} Мозг, ЭЭМ, фМРТ, contrastive learning, neural network
 \end{abstract}
 
 \section{Введение}
@@ -30,7 +32,7 @@ Functional Magnetic Resonance Imaging (fMRI) Signals}
 
 Одним из ключевых открытых вопросов остаётся природа взаимосвязи между ЭЭГ и фМРТ. С одной стороны, различия во временных масштабах (от миллисекунд у ЭЭГ до секунд у фМРТ), а также различие биофизических механизмов регистрации сигналов позволяют предположить, что эти модальности отражают принципиально разные аспекты нейронной динамики. С другой стороны, накопленные эмпирические данные указывают на существование между ними систематической связи.
 
-В частности, было показано, что связь между функциональной связностью, измеренной с помощью фМРТ, и функциональной связностью, полученной из М/ЭЭГ, во многом определяется структурной связностью белого вещества мозга, которую восстанавливают на основе данных диффузионной МРТ(dMRI). Кроме того, было продемонстрировано, что кросс-модальная связность может быть разложена на две компоненты - общую и дополнительную, которая различается между двумя модальностями. Это, в совокупности, указывает на наличие нетривиальной и многоуровневой взаимосвязи между ЭЭГ и фМРТ.
+В частности, было показано, что связь между функциональной связностью, измеренной с помощью фМРТ, и функциональной связностью, полученной из М/ЭЭГ, во многом определяется структурной связностью белого вещества мозга, которую восстанавливают на основе данных диффузионной МРТ(dMRI) \cite{Sadaghiani2020}. Кроме того, было продемонстрировано, что кросс-модальная связность может быть разложена на две компоненты - общую и дополнительную, которая различается между двумя модальностями\cite{Wirsich2021}. Это, в совокупности, указывает на наличие нетривиальной и многоуровневой взаимосвязи между ЭЭГ и фМРТ.
 %~\cite{wirsich_eeg_fmri}.
 
 Особый интерес представляет анализ одновременных записей ЭЭГ-фМРТ, поскольку они позволяют напрямую исследовать связь между электрофизиологическими процессами и гемодинамическим откликом в одних и тех же временных интервалах.
@@ -118,6 +120,17 @@ s_{ij} = \left\langle \tilde{\mathbf{z}}^{(e)}_i,\, \tilde{\mathbf{z}}^{(f)}_j \
 \]
 Минимизация $\mathcal{L}$ приводит к тому, что латентные одномерные временные ряды $\mathbf{z}^{(e)}_i$ и $\mathbf{z}^{(f)}_i$, соответствующие одной и той же записи, становятся максимально согласованными, в то время как несоответствующие пары отталкиваются.
 
-\printbibliography
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{Sadaghiani2020} Sadaghiani, S., & Wirsich, J. (2020). Intrinsic connectome
+organization across temporal scales:
+New insights from cross-modal
+approaches. Network Neuroscience,
+4(1), 1–29. \hyperlink{https://doi.org/10.1162/netn_a_00114}{Article}}
+
+\bibitem{Wirsich2021}
+Jonathan Wirsich, João Jorge, Giannina Rita Iannotti, Elhum A Shamshiri, Frédéric Grouiller, Rodolfo Abreu, François Lazeyras, Anne-Lise Giraud, Rolf Gruetter, Sepideh Sadaghiani, Serge Vulliémoz (2021) The relationship between EEG and fMRI connectomes is reproducible across simultaneous EEG-fMRI studies from 1.5 T to 7T \hyperlink{https://www.sciencedirect.com/science/article/pii/S1053811921001415}{Article}
+
+\end{thebibliography}
 
 \end{document}
