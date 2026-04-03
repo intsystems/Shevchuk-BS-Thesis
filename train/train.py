@@ -49,6 +49,7 @@ class TrainConfig:
     weight_decay = 5e-2
     num_epochs = 100
     tau = 0.1
+    var_weight = 0.25  # weight for variance regularization in loss (prevents embedding collapse)
     early_stop_patience = 15
 
     split_mode = "time"  # "subject" or "time". Use "time" to diagnose learning; "subject" for cross-subject eval
@@ -489,7 +490,7 @@ def train(config):
     print(f"EEGEncoder: {eeg_total:,} params ({eeg_trainable:,} trainable)")
     print(f"FMRIEncoder: {fmri_total:,} params ({fmri_trainable:,} trainable)")
 
-    criterion = lambda z_f, z_e: multi_positive_clip_loss(z_f, z_e, tau=config.tau)
+    criterion = lambda z_f, z_e: multi_positive_clip_loss(z_f, z_e, tau=config.tau, var_weight=config.var_weight)
 
     backbone_lr = config.learning_rate * config.eeg_backbone_lr_scale
 

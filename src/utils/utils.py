@@ -7,13 +7,23 @@ def count_params(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
-def multi_positive_clip_loss(z_f, z_e, tau=0.07):
+def _variance_loss(z, eps=1e-4):
+    """Penalize embedding dimensions whose std across the batch is below 1."""
+    std = torch.sqrt(z.var(dim=0) + eps)
+    return F.relu(1.0 - std).mean()
+
+
+def multi_positive_clip_loss(z_f, z_e, tau=0.07, var_weight=0.25):
     """
-    z_f: [B, D], fMRI embeddings
-    z_e: [B, K, D], EEG embeddings (K positives per fMRI)
+    z_f: [B, D], fMRI embeddings (pre-normalization)
+    z_e: [B, K, D], EEG embeddings (pre-normalization, K positives per fMRI)
+    var_weight: weight for variance regularization term (prevents collapse)
     """
     B, D = z_f.shape
     _, K, _ = z_e.shape
+
+    z_e_flat_raw = z_e.reshape(B * K, D)
+    var_loss = _variance_loss(z_f) + _variance_loss(z_e_flat_raw)
 
     z_f = F.normalize(z_f, dim=-1)
     z_e = F.normalize(z_e, dim=-1)
@@ -37,7 +47,7 @@ def multi_positive_clip_loss(z_f, z_e, tau=0.07):
     target = torch.arange(B, device=logits.device).repeat_interleave(K)
     loss_e2f = F.cross_entropy(logits_e2f, target)
 
-    return 0.5 * (loss_f2e + loss_e2f)
+    return 0.5 * (loss_f2e + loss_e2f) + var_weight * var_loss
 
 class SymmetricMultimodalTripletLoss(nn.Module):
     def __init__(self, margin=0.2):
