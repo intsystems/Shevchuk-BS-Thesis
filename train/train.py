@@ -36,7 +36,7 @@ class TrainConfig:
     biot_depth = 4
     biot_n_fft = 200
     biot_hop_length = 100
-    biot_pretrained_path = "../BIOT/pretrained-models/EEG-PREST-16-channels.ckpt"  # path to pretrained BIOT .pth, or None to train from scratch
+    biot_pretrained_path = "BIOT/pretrained-models/EEG-PREST-16-channels.ckpt"  # path to pretrained BIOT .pth, or None to train from scratch
     freeze_eeg_backbone = False  # freeze BIOT backbone (not recommended — breaks channel_tokens alignment)
     freeze_fmri_backbone = False
     eeg_backbone_lr_scale = 0.1  # backbone LR = learning_rate * this; projector uses full LR
@@ -277,6 +277,7 @@ def create_models(config):
         eeg_encoder.load_pretrained(config.biot_pretrained_path)
 
     fmri_encoder = FMRIEncoder1D(
+        n_roi=config.n_roi,
         embed_dim=config.embed_dim,
     )
 
