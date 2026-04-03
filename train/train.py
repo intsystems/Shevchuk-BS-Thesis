@@ -39,7 +39,7 @@ class TrainConfig:
     biot_pretrained_path = "BIOT/pretrained-models/EEG-PREST-16-channels.ckpt"  # path to pretrained BIOT .pth, or None to train from scratch
     freeze_eeg_backbone = False  # freeze BIOT backbone (not recommended — breaks channel_tokens alignment)
     freeze_fmri_backbone = False
-    eeg_backbone_lr_scale = 0.1  # backbone LR = learning_rate * this; projector uses full LR
+    eeg_backbone_lr_scale = 0.5  # backbone LR = learning_rate * this; projector uses full LR
     
     #training params
     batch_size = 64
