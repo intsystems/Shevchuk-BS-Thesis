@@ -8,10 +8,10 @@ from tqdm import tqdm
 import random
 from collections import defaultdict
 
-from src.eeg_encoder import EEGNet
-from src.fmri_encoder import FMRIEncoderROI
+from src.eeg_encoder import EEGEncoderBIOT
+from src.fmri_encoder import FMRIEncoder1D
 from src.utils.dataset import SimultEEG_fMRI, ContrastiveBatchSampler
-from src.utils.utils import multi_positive_clip_loss, count_params
+from src.utils.utils import SymmetricMultimodalTripletLoss, count_params
 
 class TrainConfig:
     data_dir = "data/"
@@ -19,24 +19,24 @@ class TrainConfig:
     
     #dataset params
     eeg_sr = 250
-    tr = 2
+    tr = 2.1
     eeg_win_sec = 2
-    hrf_shifts_sec = [4.0, 5.0, 6.0]
+    hrf_shifts_sec = [5.0]
     stride_tr = 1
     
     #models params
-    n_eeg_channels = 60
-    n_eeg_times = 500  #eeg_win_sec * eeg_sr
-    n_roi = 200  #Schaefer 200 parcellation
+    n_eeg_channels = 64
+    n_eeg_times = 500  # eeg_win_sec * eeg_sr
+    n_roi = 200  # Schaefer 200 parcellation
     embed_dim = 128
-    
-    eegnet_F1 = 8
-    eegnet_D = 2
-    eegnet_kernel_length = 64
-    eegnet_separable_kernel = 16
-    eegnet_pool1 = 4
-    eegnet_pool2 = 8
-    eegnet_dropout = 0.25
+
+    # BIOT EEG encoder
+    biot_emb_size = 256
+    biot_heads = 8
+    biot_depth = 4
+    biot_n_fft = 200
+    biot_hop_length = 100
+    biot_pretrained_path = None  # path to pretrained BIOT .pth, or None to train from scratch
     
     #training params
     batch_size = 64
@@ -45,8 +45,9 @@ class TrainConfig:
     learning_rate = 1e-4
     weight_decay = 1e-4
     num_epochs = 100
-    tau = 0.07
-    
+    triplet_margin = 0.2
+    early_stop_patience = 15
+
     train_ratio = 0.7
     val_ratio = 0.15
     test_ratio = 0.15
@@ -106,6 +107,25 @@ def split_dataset_by_subjects(dataset, train_ratio=0.7, val_ratio=0.15, seed=42)
     test_ds = SimultEEG_fMRI.from_subset(dataset, test_indices)
     
     return train_ds, val_ds, test_ds
+
+
+def augment_eeg(eeg, noise_std=0.05, channel_drop_prob=0.1):
+    """
+    eeg: [B, K, C, T]
+    Gaussian noise + per-sample channel dropout, training only.
+    """
+    eeg = eeg + torch.randn_like(eeg) * noise_std
+    if channel_drop_prob > 0:
+        # [B, 1, C, 1] — same mask across all K shifts and all time steps
+        mask = torch.bernoulli(
+            torch.full(
+                (eeg.shape[0], 1, eeg.shape[2], 1),
+                1.0 - channel_drop_prob,
+                device=eeg.device,
+            )
+        )
+        eeg = eeg * mask
+    return eeg
 
 
 def collate_fn(batch):
@@ -202,30 +222,27 @@ def create_dataloaders(config):
     return train_loader, val_loader, test_loader
 
 
-def create_models(config): 
-    eeg_encoder = EEGNet(
+def create_models(config):
+    eeg_encoder = EEGEncoderBIOT(
         n_channels=config.n_eeg_channels,
-        n_times=config.n_eeg_times,
-        n_classes=256,
-        F1=config.eegnet_F1,
-        D=config.eegnet_D,
-        kernel_length=config.eegnet_kernel_length,
-        separable_kernel=config.eegnet_separable_kernel,
-        pool1=config.eegnet_pool1,
-        pool2=config.eegnet_pool2,
-        dropout=config.eegnet_dropout,
+        emb_size=config.biot_emb_size,
+        heads=config.biot_heads,
+        depth=config.biot_depth,
+        n_fft=config.biot_n_fft,
+        hop_length=config.biot_hop_length,
         proj_dim=config.embed_dim,
     )
-    
-    fmri_encoder = FMRIEncoderROI(
-        roi_dim=config.n_roi,
+    if config.biot_pretrained_path is not None:
+        eeg_encoder.load_pretrained(config.biot_pretrained_path)
+
+    fmri_encoder = FMRIEncoder1D(
         embed_dim=config.embed_dim,
     )
-    
+
     return eeg_encoder, fmri_encoder
 
 
-def forward_batch(eeg_encoder, fmri_encoder, batch, device):
+def forward_batch(eeg_encoder, fmri_encoder, batch, device, augment=False):
     """
     Propagating batch through models
     
@@ -238,11 +255,14 @@ def forward_batch(eeg_encoder, fmri_encoder, batch, device):
     """
     eeg = batch["eeg"].to(device)
     fmri = batch["fmri"].to(device)
-    
+
+    if augment:
+        eeg = augment_eeg(eeg)
+
     B, K, C, T = eeg.shape
 
     z_f = fmri_encoder(fmri)
-    
+
     eeg_flat = eeg.view(B * K, C, T)
     z_e_flat = eeg_encoder(eeg_flat)
     
@@ -252,20 +272,21 @@ def forward_batch(eeg_encoder, fmri_encoder, batch, device):
     return z_f, z_e
 
 
-def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, config):   
+def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, config):
     eeg_encoder.train()
     fmri_encoder.train()
-    
+
     total_loss = 0.0
     num_batches = 0
-    
+
     pbar = tqdm(train_loader, desc="Training", total=config.batches_per_epoch, leave=False)
     for batch in pbar:
         optimizer.zero_grad()
-        
-        z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device)
-        loss = multi_positive_clip_loss(z_f, z_e, tau=config.tau)
-        
+
+        z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device, augment=True)
+        K = z_e.shape[1]
+        loss = sum(criterion(z_e[:, k, :], z_f) for k in range(K)) / K
+
         loss.backward()
         
         torch.nn.utils.clip_grad_norm_(eeg_encoder.parameters(), max_norm=1.0)
@@ -285,20 +306,21 @@ def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, config):
 
 
 @torch.no_grad()
-def validate(eeg_encoder, fmri_encoder, val_loader, config):
+def validate(eeg_encoder, fmri_encoder, val_loader, criterion, config):
     eeg_encoder.eval()
     fmri_encoder.eval()
-    
+
     total_loss = 0.0
     num_batches = 0
-    
+
     for batch in tqdm(val_loader, desc="Validation", leave=False):
         z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device)
-        loss = multi_positive_clip_loss(z_f, z_e, tau=config.tau)
-        
+        K = z_e.shape[1]
+        loss = sum(criterion(z_e[:, k, :], z_f) for k in range(K)) / K
+
         total_loss += loss.item()
         num_batches += 1
-    
+
     return total_loss / max(num_batches, 1)
 
 
@@ -394,8 +416,10 @@ def train(config):
     
     eeg_total, eeg_trainable = count_params(eeg_encoder)
     fmri_total, fmri_trainable = count_params(fmri_encoder)
-    print(f"EEGNet: {eeg_total:,} params ({eeg_trainable:,} trainable)")
+    print(f"EEGEncoder: {eeg_total:,} params ({eeg_trainable:,} trainable)")
     print(f"FMRIEncoder: {fmri_total:,} params ({fmri_trainable:,} trainable)")
+
+    criterion = SymmetricMultimodalTripletLoss(margin=config.triplet_margin).to(config.device)
     
     params = list(eeg_encoder.parameters()) + list(fmri_encoder.parameters())
     optimizer = optim.AdamW(
@@ -414,7 +438,8 @@ def train(config):
     )
     
     best_val_loss = float("inf")
-    
+    patience_counter = 0
+
     print("\n" + "=" * 60)
     print("Training")
     print("=" * 60)
@@ -422,9 +447,9 @@ def train(config):
     for epoch in range(1, config.num_epochs + 1):
         print(f"\nЭпоха {epoch}/{config.num_epochs}")
         
-        train_loss = train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, config)
-        
-        val_loss = validate(eeg_encoder, fmri_encoder, val_loader, config)
+        train_loss = train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, config)
+
+        val_loss = validate(eeg_encoder, fmri_encoder, val_loader, criterion, config)
         
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
@@ -434,15 +459,22 @@ def train(config):
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-        
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
         if epoch % config.save_every == 0 or is_best:
             save_checkpoint(eeg_encoder, fmri_encoder, optimizer, epoch, val_loss, config, is_best)
-        
+
         if epoch % 10 == 0:
             metrics = compute_retrieval_accuracy(eeg_encoder, fmri_encoder, val_loader, config)
             if metrics:
                 metrics_str = " | ".join([f"{k}: {v:.1f}%" for k, v in metrics.items()])
                 print(f"Retrieval: {metrics_str}")
+
+        if patience_counter >= config.early_stop_patience:
+            print(f"Early stopping at epoch {epoch} (no improvement for {config.early_stop_patience} epochs)")
+            break
     
     print("\n" + "=" * 60)
     print("Done")
@@ -453,7 +485,7 @@ def train(config):
     if best_path.exists():
         load_checkpoint(eeg_encoder, fmri_encoder, None, best_path, config.device)
     
-    test_loss = validate(eeg_encoder, fmri_encoder, test_loader, config)
+    test_loss = validate(eeg_encoder, fmri_encoder, test_loader, criterion, config)
     test_metrics = compute_retrieval_accuracy(eeg_encoder, fmri_encoder, test_loader, config)
     
     print(f"Test Loss: {test_loss:.4f}")
