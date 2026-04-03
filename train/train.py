@@ -492,16 +492,25 @@ def train(config):
     criterion = lambda z_f, z_e: multi_positive_clip_loss(z_f, z_e, tau=config.tau)
 
     backbone_lr = config.learning_rate * config.eeg_backbone_lr_scale
+
+    # channel_tokens are randomly initialized — they need full LR to learn the montage layout
+    # The rest of the BIOT backbone is pretrained — update slowly to preserve those weights
+    channel_token_params = [p for n, p in eeg_encoder.encoder.named_parameters()
+                            if "channel_tokens" in n and p.requires_grad]
+    backbone_params = [p for n, p in eeg_encoder.encoder.named_parameters()
+                       if "channel_tokens" not in n and p.requires_grad]
+
     optimizer = optim.AdamW(
         [
-            {"params": [p for p in eeg_encoder.encoder.parameters() if p.requires_grad], "lr": backbone_lr},
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": channel_token_params},
             {"params": [p for p in eeg_encoder.proj.parameters() if p.requires_grad]},
             {"params": [p for p in fmri_encoder.parameters() if p.requires_grad]},
         ],
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    print(f"Optimizer: backbone LR={backbone_lr:.2e}, projectors/fMRI LR={config.learning_rate:.2e}")
+    print(f"Optimizer: backbone LR={backbone_lr:.2e}, channel_tokens/projectors/fMRI LR={config.learning_rate:.2e}")
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
