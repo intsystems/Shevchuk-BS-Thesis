@@ -41,7 +41,7 @@ class TrainConfig:
     #training params
     batch_size = 64
     subs_per_batch = 2
-    min_temp_dist = 30
+    min_temp_dist = 10
     learning_rate = 1e-4
     weight_decay = 1e-2
     num_epochs = 100
@@ -192,6 +192,7 @@ def create_dataloaders(config):
         subs_per_batch=min(config.subs_per_batch, len(set(m["sub"] for m in train_ds.meta))),
         min_temp_dist=config.min_temp_dist,
         drop_last=True,
+        max_batches=config.batches_per_epoch,
     )
     
     train_loader = DataLoader(

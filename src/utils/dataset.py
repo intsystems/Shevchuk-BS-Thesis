@@ -118,7 +118,7 @@ class SimultEEG_fMRI(Dataset):
                 self.index.append((pair_id, tr_idx))
                 self.meta.append({
                     "sub": sub,
-                    "run": run,
+                    "run": pair_id,  # unique per recording file, so temporal distance is only enforced within the same fMRI/EEG pair
                     "tr": tr_idx,
                 })
 
@@ -257,12 +257,14 @@ class ContrastiveBatchSampler(Sampler):
         subs_per_batch=8,
         min_temp_dist=5,
         drop_last=True,
+        max_batches=None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.subs_per_batch = subs_per_batch
         self.min_temp_dist = min_temp_dist
         self.drop_last = drop_last
+        self.max_batches = max_batches
 
         assert batch_size % subs_per_batch == 0
         self.M = batch_size // subs_per_batch
@@ -275,15 +277,19 @@ class ContrastiveBatchSampler(Sampler):
         self.subs = list(self.by_sub.keys())
 
     def __iter__(self):
-        subs = self.subs[:]
-        random.shuffle(subs)
+        if len(self.subs) < self.subs_per_batch:
+            return
 
-        while True:
-            if len(subs) < self.subs_per_batch:
+        n_yielded = 0
+        max_attempts = 1000
+
+        for _ in range(max_attempts):
+            if self.max_batches is not None and n_yielded >= self.max_batches:
                 break
 
-            chosen_subs = random.sample(subs, self.subs_per_batch)
+            chosen_subs = random.sample(self.subs, self.subs_per_batch)
             batch = []
+            success = True
 
             for sub in chosen_subs:
                 indices = self.by_sub[sub][:]
@@ -312,16 +318,17 @@ class ContrastiveBatchSampler(Sampler):
                         break
 
                 if len(picked) < self.M:
+                    success = False
                     break
 
                 batch.extend(picked)
 
-            if len(batch) == self.batch_size:
+            if success and len(batch) == self.batch_size:
                 yield batch
+                n_yielded += 1
             elif not self.drop_last and len(batch) > 0:
                 yield batch
-            else:
-                break
+                n_yielded += 1
 
     def __len__(self):
         if self.drop_last:
