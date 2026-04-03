@@ -48,6 +48,7 @@ class TrainConfig:
     tau = 0.07
     early_stop_patience = 15
 
+    split_mode = "time"  # "subject" or "time". Use "time" to diagnose learning; "subject" for cross-subject eval
     train_ratio = 0.6
     val_ratio = 0.2
     test_ratio = 0.2
@@ -65,6 +66,36 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def split_dataset_by_time(dataset, train_ratio=0.6, val_ratio=0.2, seed=42):
+    """Split by time within each subject/recording — val/test see same subjects as train."""
+    random.seed(seed)
+
+    # group by (sub, run) so we split each recording independently
+    from collections import defaultdict
+    pair_to_indices = defaultdict(list)
+    for idx, (pair_id, tr_idx) in enumerate(dataset.index):
+        pair_to_indices[pair_id].append((tr_idx, idx))
+
+    train_indices, val_indices, test_indices = [], [], []
+    for pair_id, items in pair_to_indices.items():
+        items_sorted = [idx for _, idx in sorted(items)]
+        n = len(items_sorted)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        train_indices.extend(items_sorted[:n_train])
+        val_indices.extend(items_sorted[n_train:n_train + n_val])
+        test_indices.extend(items_sorted[n_train + n_val:])
+
+    subs = set(m["sub"] for m in dataset.meta)
+    print(f"Subjects (all splits share): {sorted(subs)}")
+    print(f"Samples: train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+
+    train_ds = SimultEEG_fMRI.from_subset(dataset, train_indices)
+    val_ds = SimultEEG_fMRI.from_subset(dataset, val_indices)
+    test_ds = SimultEEG_fMRI.from_subset(dataset, test_indices)
+    return train_ds, val_ds, test_ds
 
 
 def split_dataset_by_subjects(dataset, train_ratio=0.7, val_ratio=0.15, seed=42):
@@ -179,12 +210,20 @@ def create_dataloaders(config):
     
     print(f"Total samples: {len(full_dataset)}")
     
-    train_ds, val_ds, test_ds = split_dataset_by_subjects(
-        full_dataset,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        seed=config.seed,
-    )
+    if config.split_mode == "time":
+        train_ds, val_ds, test_ds = split_dataset_by_time(
+            full_dataset,
+            train_ratio=config.train_ratio,
+            val_ratio=config.val_ratio,
+            seed=config.seed,
+        )
+    else:
+        train_ds, val_ds, test_ds = split_dataset_by_subjects(
+            full_dataset,
+            train_ratio=config.train_ratio,
+            val_ratio=config.val_ratio,
+            seed=config.seed,
+        )
     
     train_sampler = ContrastiveBatchSampler(
         train_ds,
