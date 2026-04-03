@@ -36,16 +36,19 @@ class TrainConfig:
     biot_depth = 4
     biot_n_fft = 200
     biot_hop_length = 100
-    biot_pretrained_path = None  # path to pretrained BIOT .pth, or None to train from scratch
+    biot_pretrained_path = "../BIOT/pretrained-models/EEG-PREST-16-channels.ckpt"  # path to pretrained BIOT .pth, or None to train from scratch
+    freeze_eeg_backbone = False  # freeze BIOT backbone (not recommended — breaks channel_tokens alignment)
+    freeze_fmri_backbone = False
+    eeg_backbone_lr_scale = 0.1  # backbone LR = learning_rate * this; projector uses full LR
     
     #training params
     batch_size = 64
     subs_per_batch = 2
     min_temp_dist = 10
     learning_rate = 1e-4
-    weight_decay = 1e-2
+    weight_decay = 5e-2
     num_epochs = 100
-    tau = 0.07
+    tau = 0.1
     early_stop_patience = 15
 
     split_mode = "time"  # "subject" or "time". Use "time" to diagnose learning; "subject" for cross-subject eval
@@ -176,11 +179,9 @@ def collate_fn(batch):
     K = len(batch[0]["eeg"])
     
     eeg_list = []
-    for i, sample in enumerate(batch):
+    for sample in batch:
         eeg_windows = np.stack(sample["eeg"], axis=0)
         eeg_list.append(eeg_windows)
-    
-    shapes = [arr.shape for arr in eeg_list]
     
     eeg = np.stack(eeg_list, axis=0)
     eeg = torch.from_numpy(eeg).float()
@@ -345,19 +346,32 @@ def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, c
 
 
 @torch.no_grad()
-def validate(eeg_encoder, fmri_encoder, val_loader, criterion, config):
+def validate(eeg_encoder, fmri_encoder, val_loader, criterion, config, log_collapse=False):
     eeg_encoder.eval()
     fmri_encoder.eval()
 
     total_loss = 0.0
     num_batches = 0
+    all_z_f, all_z_e0 = [], []
 
     for batch in tqdm(val_loader, desc="Validation", leave=False):
         z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device)
         loss = criterion(z_f, z_e)
-
         total_loss += loss.item()
         num_batches += 1
+        if log_collapse:
+            all_z_f.append(z_f)
+            all_z_e0.append(z_e[:, 0, :])
+
+    if log_collapse and all_z_f:
+        import torch.nn.functional as F
+        z_f_cat = F.normalize(torch.cat(all_z_f), dim=-1)
+        z_e_cat = F.normalize(torch.cat(all_z_e0), dim=-1)
+        # mean pairwise cosine sim (sampled) — close to 1.0 means collapse
+        n = min(512, z_f_cat.shape[0])
+        sim_f = (z_f_cat[:n] @ z_f_cat[:n].T).fill_diagonal_(0).sum() / (n * (n - 1))
+        sim_e = (z_e_cat[:n] @ z_e_cat[:n].T).fill_diagonal_(0).sum() / (n * (n - 1))
+        print(f"  [collapse check] mean cosine sim — fMRI: {sim_f:.3f}, EEG: {sim_e:.3f}  (>0.9 = collapsed)")
 
     return total_loss / max(num_batches, 1)
 
@@ -456,20 +470,37 @@ def train(config):
     eeg_encoder, fmri_encoder = create_models(config)
     eeg_encoder.to(config.device)
     fmri_encoder.to(config.device)
-    
+
+    if config.freeze_eeg_backbone:
+        if config.biot_pretrained_path is None:
+            print("WARNING: freeze_eeg_backbone=True but no pretrained weights loaded — freezing a random backbone is not useful.")
+        for name, param in eeg_encoder.encoder.named_parameters():
+            if "channel_tokens" not in name:  # keep channel_tokens trainable — they are randomly initialized for this montage
+                param.requires_grad = False
+
+    if config.freeze_fmri_backbone:
+        for name, param in fmri_encoder.named_parameters():
+            if "proj" not in name:
+                param.requires_grad = False
+
     eeg_total, eeg_trainable = count_params(eeg_encoder)
     fmri_total, fmri_trainable = count_params(fmri_encoder)
     print(f"EEGEncoder: {eeg_total:,} params ({eeg_trainable:,} trainable)")
     print(f"FMRIEncoder: {fmri_total:,} params ({fmri_trainable:,} trainable)")
 
     criterion = lambda z_f, z_e: multi_positive_clip_loss(z_f, z_e, tau=config.tau)
-    
-    params = list(eeg_encoder.parameters()) + list(fmri_encoder.parameters())
+
+    backbone_lr = config.learning_rate * config.eeg_backbone_lr_scale
     optimizer = optim.AdamW(
-        params,
+        [
+            {"params": [p for p in eeg_encoder.encoder.parameters() if p.requires_grad], "lr": backbone_lr},
+            {"params": [p for p in eeg_encoder.proj.parameters() if p.requires_grad]},
+            {"params": [p for p in fmri_encoder.parameters() if p.requires_grad]},
+        ],
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    print(f"Optimizer: backbone LR={backbone_lr:.2e}, projectors/fMRI LR={config.learning_rate:.2e}")
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -491,7 +522,7 @@ def train(config):
         
         train_loss = train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, config)
 
-        val_loss = validate(eeg_encoder, fmri_encoder, val_loader, criterion, config)
+        val_loss = validate(eeg_encoder, fmri_encoder, val_loader, criterion, config, log_collapse=(epoch % 10 == 0))
         
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']

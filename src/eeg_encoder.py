@@ -38,10 +38,9 @@ class EEGEncoderBIOT(nn.Module):
 
     def load_pretrained(self, path: str):
         """
-        Load pretrained BIOT weights from a different-channel checkpoint.
-        channel_tokens are tiled cyclically from the pretrained channel count
-        to the target channel count (e.g. 16 → 64).
-        index is skipped — the new model already has the correct 0..n_channels-1 index.
+        Load pretrained BIOT weights.
+        channel_tokens and index are dropped — they are sensor-layout-specific
+        and will be trained from scratch for the target montage.
         """
         state = torch.load(path, map_location="cpu")
 
@@ -49,17 +48,8 @@ class EEGEncoderBIOT(nn.Module):
         if any(k.startswith("biot.") for k in state):
             state = {k[len("biot."):]: v for k, v in state.items() if k.startswith("biot.")}
 
-        # Tile channel_tokens to match the target channel count
-        if "channel_tokens.weight" in state:
-            pretrained = state["channel_tokens.weight"]          # [n_pre, 256]
-            n_pre = pretrained.shape[0]
-            n_target = self.encoder.channel_tokens.num_embeddings
-            repeats = (n_target + n_pre - 1) // n_pre
-            tiled = pretrained.repeat(repeats, 1)[:n_target]    # [n_target, 256]
-            state["channel_tokens.weight"] = tiled
-            print(f"  channel_tokens tiled {n_pre} → {n_target}")
-
-        # Drop index — new model already holds the correct 0..n_channels-1 values
+        # Drop sensor-layout-specific weights — keep them randomly initialized
+        state.pop("channel_tokens.weight", None)
         state.pop("index", None)
 
         missing, unexpected = self.encoder.load_state_dict(state, strict=False)

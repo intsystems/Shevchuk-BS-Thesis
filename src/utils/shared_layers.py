@@ -3,13 +3,14 @@ from torch import nn
 import torch.nn.functional as F
 
 class Projector(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, dropout=0.3):
         super().__init__()
 
         self.net = nn.Sequential(
             nn.Linear(input_dim, input_dim),
             nn.LayerNorm(input_dim),
             nn.ELU(),
+            nn.Dropout(p=dropout),
             nn.Linear(input_dim, output_dim),
         )
 
