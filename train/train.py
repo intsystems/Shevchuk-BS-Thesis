@@ -495,7 +495,9 @@ def train(config):
     
     return eeg_encoder, fmri_encoder
 
-
+from src.utils.preprocess_data import download_natview_subjects
 if __name__ == "__main__":
+    
+    download_natview_subjects(start_sub=1, end_sub=1, out_dir="data")
     config = TrainConfig()
     train(config)

@@ -47,7 +47,7 @@ class SimultEEG_fMRI(Dataset):
 
         self.meta = []
 
-        #self._preprocess()
+        self._preprocess()
         self._build_pairs_and_index()
     
     @classmethod
