@@ -86,11 +86,14 @@ class SymmetricMultimodalTripletLoss(nn.Module):
         hard_neg_eeg_for_eeg = neg_intra_eeg_masked.min(dim=1)[0]
         hard_neg_fmri_for_fmri = neg_intra_fmri_masked.min(dim=1)[0]
 
-        # 5. Compute the 4 Triplet Losses: L = max(0, d_pos - d_neg + margin)
-        loss_cross_eeg  = F.relu(pos_dist - hard_neg_fmri_for_eeg + self.margin)
-        loss_cross_fmri = F.relu(pos_dist - hard_neg_eeg_for_fmri + self.margin)
-        loss_intra_eeg  = F.relu(pos_dist - hard_neg_eeg_for_eeg + self.margin)
-        loss_intra_fmri = F.relu(pos_dist - hard_neg_fmri_for_fmri + self.margin)
+        def soft_triplet(pos, neg):
+            # Softplus(x) = ln(1 + exp(x))
+            return F.softplus(pos - neg + self.margin)
+
+        loss_cross_eeg  = soft_triplet(pos_dist, hard_neg_fmri_for_eeg)
+        loss_cross_fmri = soft_triplet(pos_dist, hard_neg_eeg_for_fmri)
+        loss_intra_eeg  = soft_triplet(pos_dist, hard_neg_eeg_for_eeg)
+        loss_intra_fmri = soft_triplet(pos_dist, hard_neg_fmri_for_fmri)
 
         # 6. Average the losses
         total_loss = (
@@ -99,5 +102,5 @@ class SymmetricMultimodalTripletLoss(nn.Module):
             loss_intra_eeg.mean() + 
             loss_intra_fmri.mean()
         ) / 4.0
-
+        print(f"DEBUG: pos={pos_dist.mean().item():.4f}, neg={hard_neg_fmri_for_eeg.mean().item():.4f}")
         return total_loss

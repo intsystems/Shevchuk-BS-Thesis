@@ -11,17 +11,17 @@ from collections import defaultdict
 from src.eeg_encoder import EEGEncoderBIOT
 from src.fmri_encoder import FMRIEncoder1D
 from src.utils.dataset import SimultEEG_fMRI, ContrastiveBatchSampler
-from src.utils.utils import SymmetricMultimodalTripletLoss, count_params
+from src.utils.utils import multi_positive_clip_loss, count_params
 
 class TrainConfig:
-    data_dir = "data/"
+    data_dir = "data/projects/EEG_FMRI/data_indi_preproc/"
     checkpoint_dir = "checkpoints/"
     
     #dataset params
     eeg_sr = 250
     tr = 2.1
     eeg_win_sec = 2
-    hrf_shifts_sec = [5.0]
+    hrf_shifts_sec = [4.5, 5.0, 5.5]
     stride_tr = 1
     
     #models params
@@ -40,23 +40,23 @@ class TrainConfig:
     
     #training params
     batch_size = 64
-    subs_per_batch = 8
-    min_temp_dist = 5
+    subs_per_batch = 2
+    min_temp_dist = 30
     learning_rate = 1e-4
-    weight_decay = 1e-4
+    weight_decay = 1e-2
     num_epochs = 100
-    triplet_margin = 0.2
+    tau = 0.07
     early_stop_patience = 15
 
-    train_ratio = 0.7
-    val_ratio = 0.15
-    test_ratio = 0.15
+    train_ratio = 0.6
+    val_ratio = 0.2
+    test_ratio = 0.2
     
     seed = 42
     device = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers = 0
     save_every = 5
-    batches_per_epoch = 100
+    batches_per_epoch = 50
 
 
 def set_seed(seed):
@@ -278,14 +278,16 @@ def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, c
 
     total_loss = 0.0
     num_batches = 0
-
+    print("a")
     pbar = tqdm(train_loader, desc="Training", total=config.batches_per_epoch, leave=False)
     for batch in pbar:
         optimizer.zero_grad()
 
+        if num_batches == 0:
+            print("Successfully started first training batch!")
+
         z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device, augment=True)
-        K = z_e.shape[1]
-        loss = sum(criterion(z_e[:, k, :], z_f) for k in range(K)) / K
+        loss = criterion(z_f, z_e)
 
         loss.backward()
         
@@ -298,9 +300,6 @@ def train_epoch(eeg_encoder, fmri_encoder, train_loader, optimizer, criterion, c
         num_batches += 1
         
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-        
-        if num_batches >= config.batches_per_epoch:
-            break
     
     return total_loss / max(num_batches, 1)
 
@@ -315,8 +314,7 @@ def validate(eeg_encoder, fmri_encoder, val_loader, criterion, config):
 
     for batch in tqdm(val_loader, desc="Validation", leave=False):
         z_f, z_e = forward_batch(eeg_encoder, fmri_encoder, batch, config.device)
-        K = z_e.shape[1]
-        loss = sum(criterion(z_e[:, k, :], z_f) for k in range(K)) / K
+        loss = criterion(z_f, z_e)
 
         total_loss += loss.item()
         num_batches += 1
@@ -410,6 +408,11 @@ def train(config):
     
     train_loader, val_loader, test_loader = create_dataloaders(config)
     
+    print(f"DEBUG: Number of batches in train_loader: {len(train_loader)}")
+    if len(train_loader) == 0:
+        print("ERROR: train_loader is empty! Check your Sampler constraints or Subject count.")
+        return
+
     eeg_encoder, fmri_encoder = create_models(config)
     eeg_encoder.to(config.device)
     fmri_encoder.to(config.device)
@@ -419,7 +422,7 @@ def train(config):
     print(f"EEGEncoder: {eeg_total:,} params ({eeg_trainable:,} trainable)")
     print(f"FMRIEncoder: {fmri_total:,} params ({fmri_trainable:,} trainable)")
 
-    criterion = SymmetricMultimodalTripletLoss(margin=config.triplet_margin).to(config.device)
+    criterion = lambda z_f, z_e: multi_positive_clip_loss(z_f, z_e, tau=config.tau)
     
     params = list(eeg_encoder.parameters()) + list(fmri_encoder.parameters())
     optimizer = optim.AdamW(
@@ -434,7 +437,6 @@ def train(config):
         factor=0.5,
         patience=5,
         min_lr=config.learning_rate * 0.01,
-        verbose=True,
     )
     
     best_val_loss = float("inf")
@@ -495,9 +497,10 @@ def train(config):
     
     return eeg_encoder, fmri_encoder
 
-from src.utils.preprocess_data import download_natview_subjects
+from src.utils.preprocess_data import download_natview_subjects, extract_all_tar_gz
 if __name__ == "__main__":
     
-    download_natview_subjects(start_sub=1, end_sub=1, out_dir="data")
+    download_natview_subjects(start_sub=1, end_sub=5, out_dir="data")
+    #extract_all_tar_gz()
     config = TrainConfig()
     train(config)
