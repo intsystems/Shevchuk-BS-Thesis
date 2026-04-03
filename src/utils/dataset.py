@@ -127,22 +127,30 @@ class SimultEEG_fMRI(Dataset):
 
     def _preprocess(self):
         """
-            Detects EEG data, applies filterband, transforms data to .npy
-            Detects fMRI data, transforms it to .npy
+            Detects EEG data, applies filterband, transforms data to .npy, and Z-normalizes
+            Detects fMRI data, transforms it to .npy, and Z-normalizes
             Then forms slices of the data based on TR of fMRI
         """
 
         DATA_ROOT = Path(self.dirname).resolve()
         func_dirs = DATA_ROOT.glob("sub-*/ses-*/func")
 
+        # --- 1. fMRI PREPROCESSING & NORMALIZATION ---
         if config.use_parcellation == True:
             #gather .tsv files and transform them into .npy
             for func_root in func_dirs:
                 pattern = f"*{config.parcellation_suffix}*.tsv"
                 for tsv_path in func_root.rglob(pattern):
                     arr = np.loadtxt(tsv_path, delimiter="\t")
-                    np.save(tsv_path.with_suffix(".npy"), arr)
-                    print(f"OK: {tsv_path}")
+                    
+                    # Assume shape is [n_roi, time] based on your __getitem__
+                    # Z-normalize per ROI across the entire time run
+                    mean_roi = np.mean(arr, axis=1, keepdims=True)
+                    std_roi = np.std(arr, axis=1, keepdims=True)
+                    arr_norm = (arr - mean_roi) / (std_roi + 1e-8)
+                    
+                    np.save(tsv_path.with_suffix(".npy"), arr_norm)
+                    print(f"OK (Z-scored): {tsv_path}")
         else:
             #without parcellation we must extract raw fmri data
             func_preproc_dirs = func_dirs.glob("func_preproc")
@@ -152,18 +160,39 @@ class SimultEEG_fMRI(Dataset):
                     img = nib.load(file)
                     data = img.get_fdata()
 
-                    np.save(file.with_suffix(".npy"), data)
+                    # Assume shape is [X, Y, Z, time] based on your __getitem__
+                    # Z-normalize per voxel across the entire time run
+                    mean_vox = np.mean(data, axis=3, keepdims=True)
+                    std_vox = np.std(data, axis=3, keepdims=True)
+                    data_norm = (data - mean_vox) / (std_vox + 1e-8)
 
-        #transforming eeg data:
+                    np.save(file.with_suffix(".npy"), data_norm)
+                    print(f"OK (Z-scored): {file.name}")
+
+        # --- 2. EEG PREPROCESSING & NORMALIZATION ---
         eeg_dirs = DATA_ROOT.glob("sub-*/ses-*/eeg")
         for eeg_root in eeg_dirs:
             pattern = f"*.set"
             for file_path in eeg_root.rglob(pattern):
                 if "checkeroff" in file_path.name or "checkerout" in file_path.name or "checker_recording" in file_path.name:
                     continue
-                print(f"OK: {file_path.name}")
+                
                 bandpass_filter(file_path, config.lower_freq, config.higher_freq)
                 save_as_npy(file_path)
+                
+                # Load the newly created .npy to apply Z-normalization
+                npy_path = file_path.with_suffix(".npy")
+                if npy_path.exists():
+                    eeg_data = np.load(npy_path)
+                    
+                    # Assume shape is [n_ch, time]
+                    # Z-normalize per channel across the entire recording
+                    mean_ch = np.mean(eeg_data, axis=1, keepdims=True)
+                    std_ch = np.std(eeg_data, axis=1, keepdims=True)
+                    eeg_norm = (eeg_data - mean_ch) / (std_ch + 1e-8)
+                    
+                    np.save(npy_path, eeg_norm)
+                    print(f"OK (Filtered & Z-scored): {npy_path.name}")
 
     def __getitem__(self, idx):
         pair_id, tr_idx = self.index[idx]

@@ -5,6 +5,8 @@ import requests
 from tqdm import tqdm
 import tarfile
 
+#FOR NATVIEW DATASET
+
 def bandpass_filter(filename, lower_freq, higher_freq):
     """
     Used to filter out freq outside of [lower_freq, higher_freq]
