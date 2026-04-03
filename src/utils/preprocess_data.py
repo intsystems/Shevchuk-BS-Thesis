@@ -58,7 +58,8 @@ def download_natview_subjects(
         url = f"{base_url}/{sub_id}.tar.gz"
         out_path = os.path.join(out_dir, f"{sub_id}.tar.gz")
 
-        if os.path.exists(out_path):
+        sub_dir = os.path.join(out_dir, sub_id)
+        if os.path.exists(sub_dir):
             print(f"[SKIP] {sub_id} already downloaded")
             continue
 
@@ -77,6 +78,12 @@ def download_natview_subjects(
                 if chunk:
                     f.write(chunk)
                     pbar.update(len(chunk))
+
+        print(f"[EXTRACT] {sub_id}")
+        with tarfile.open(out_path, "r:gz") as tar:
+            tar.extractall(path=out_dir)
+        os.remove(out_path)
+        print(f"[DELETED] {sub_id}.tar.gz")
 
 def extract_all_tar_gz(data_dir="data"):
     for fname in os.listdir(data_dir):
