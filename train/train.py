@@ -12,57 +12,7 @@ from src.eeg_encoder import EEGEncoderBIOT
 from src.fmri_encoder import FMRIEncoder1D
 from src.utils.dataset import SimultEEG_fMRI, ContrastiveBatchSampler
 from src.utils.utils import multi_positive_clip_loss, count_params
-
-class TrainConfig:
-    data_dir = "data/projects/EEG_FMRI/data_indi_preproc/"
-    checkpoint_dir = "checkpoints/"
-    
-    #dataset params
-    eeg_sr = 250
-    tr = 2.1
-    eeg_win_sec = 2
-    hrf_shifts_sec = [4.5, 5.0, 5.5]
-    stride_tr = 1
-    
-    #models params
-    n_eeg_channels = 64
-    n_eeg_times = 500  # eeg_win_sec * eeg_sr
-    n_roi = 200  # Schaefer 200 parcellation
-    embed_dim = 128
-
-    # BIOT EEG encoder
-    biot_emb_size = 256
-    biot_heads = 8
-    biot_depth = 4
-    biot_n_fft = 200
-    biot_hop_length = 100
-    biot_pretrained_path = "BIOT/pretrained-models/EEG-PREST-16-channels.ckpt"  # path to pretrained BIOT .pth, or None to train from scratch
-    freeze_eeg_backbone = False  # freeze BIOT backbone (not recommended — breaks channel_tokens alignment)
-    freeze_fmri_backbone = False
-    eeg_backbone_lr_scale = 0.5  # backbone LR = learning_rate * this; projector uses full LR
-    
-    #training params
-    batch_size = 64
-    subs_per_batch = 2
-    min_temp_dist = 10
-    learning_rate = 1e-4
-    weight_decay = 5e-2
-    num_epochs = 100
-    tau = 0.1
-    var_weight = 0.25  # weight for variance regularization in loss (prevents embedding collapse)
-    early_stop_patience = 15
-
-    split_mode = "time"  # "subject" or "time". Use "time" to diagnose learning; "subject" for cross-subject eval
-    train_ratio = 0.6
-    val_ratio = 0.2
-    test_ratio = 0.2
-    
-    seed = 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers = 0
-    save_every = 5
-    batches_per_epoch = 50
-
+from config import TrainConfig
 
 def set_seed(seed):
     random.seed(seed)

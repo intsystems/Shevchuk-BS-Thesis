@@ -2,24 +2,40 @@ from torch.utils.data import Dataset, Sampler
 import numpy as np
 from pathlib import Path
 import nibabel as nib
+import pandas as pd
 import random
 from collections import defaultdict
 import copy
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
-from src import config
-from src.utils.preprocess_data import save_as_npy, bandpass_filter
+from train.config import TrainConfig
+from src.utils.preprocess_data import save_as_npy, downsample_eeg, bandpass_filter, transform_to_neurostorm_space
+
+def _convert_tsv(tsv_path):
+    arr = pd.read_csv(tsv_path, sep="\t", header=None).to_numpy(dtype=np.float32)
+    np.save(tsv_path.with_suffix(".npy"), arr)
+    return tsv_path.name
+
+
+def _convert_nii(args):
+    import torch
+    torch.set_num_threads(1)
+    from src.utils.preprocess_data import transform_to_neurostorm_space
+
+    file, scaling_factor = args
+    out = file.with_suffix("").with_suffix(".npy")  # .nii.gz -> .npy
+    img = nib.load(file)
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    data = transform_to_neurostorm_space(data, scaling_factor)
+    np.save(out, data)
+    return file.name
+
 
 class SimultEEG_fMRI(Dataset):
     def __init__(
         self,
-        dirname,
-        eeg_sr=250,
-        tr=2.1,
-        eeg_win_sec=2,
-        hrf_shifts_sec=[5.0],
-        stride_tr=1,
-        min_margin_sec=0.0,
-        n_eeg_channels=60,
+        config: TrainConfig,  
     ):
         """
         Arguments:
@@ -30,17 +46,12 @@ class SimultEEG_fMRI(Dataset):
         hrf_shifts_sec(float) -- array of shifts(for multiple positives), each element ishow much to shift to the left to capture eeg signal, because fmri and eeg are not aligned in time
         n_eeg_channels(int) -- number of eeg channels
         """
-        super().__init__();
 
-        self.dirname = dirname
-        self.root = Path(dirname).resolve()
-        self.eeg_sr = float(eeg_sr)
-        self.tr = float(tr)
-        self.eeg_win_sec = float(eeg_win_sec)
-        self.hrf_shifts_sec = np.array(hrf_shifts_sec)
-        self.stride_tr = int(stride_tr)
-        self.min_margin_sec = float(min_margin_sec)
-        self.n_eeg_channels = int(n_eeg_channels)
+        super().__init__();
+        self.config = config.data
+
+        self.dirname = self.config.data_dir
+        self.root = Path(self.dirname).resolve()
 
         self.pairs = []   #list of dicts with eeg_path, fmri_path, n_tr, etc.
         self.index = []   #list of (pair_id, tr_idx)
@@ -62,9 +73,9 @@ class SimultEEG_fMRI(Dataset):
         return len(self.index)
 
     def _build_pairs_and_index(self):
-        to_find = config.no_parcellation_prefix
-        if config.use_parcellation == True:
-            to_find = config.parcellation_suffix
+        to_find = self.config.no_parcellation_prefix
+        if self.config.use_parcellation:
+            to_find = self.config.parcellation_suffix
         
         fmri_npy_files = list(self.root.rglob(f"*{to_find}*.npy"))
         global_id = 0
@@ -80,7 +91,7 @@ class SimultEEG_fMRI(Dataset):
             fmri = np.load(fmri_path, mmap_mode="r")
 
             #number of frames
-            if config.use_parcellation == True:
+            if self.config.use_parcellation:
                 n_tr = fmri.shape[1]
             else:
                 n_tr = fmri.shape[3]
@@ -98,9 +109,9 @@ class SimultEEG_fMRI(Dataset):
 
             pair_id = len(self.pairs)
             
-            t_min = self.min_margin_sec + np.max(self.hrf_shifts_sec) + self.eeg_win_sec / 2
-            min_tr = int(np.ceil(t_min / self.tr))
-            max_tr = n_tr - int(np.ceil(self.min_margin_sec + self.eeg_win_sec / 2))
+            t_min = np.max(self.config.hrf_shifts_sec)
+            min_tr = int(np.ceil(t_min / self.config.tr))
+            max_tr = int(np.ceil(n_tr - np.ceil(self.config.eeg_win_sec / self.config.tr) - np.max(self.config.hrf_shifts_sec)))
 
             self.pairs.append({
                 "eeg_path": eeg_path,
@@ -114,7 +125,7 @@ class SimultEEG_fMRI(Dataset):
 
             global_id += max_tr - min_tr + 1
 
-            for tr_idx in range(min_tr, max_tr, self.stride_tr):
+            for tr_idx in range(min_tr, max_tr, self.config.stride_tr):
                 self.index.append((pair_id, tr_idx))
                 self.meta.append({
                     "sub": sub,
@@ -136,38 +147,25 @@ class SimultEEG_fMRI(Dataset):
         func_dirs = DATA_ROOT.glob("sub-*/ses-*/func")
 
         # --- 1. fMRI PREPROCESSING & NORMALIZATION ---
-        if config.use_parcellation == True:
-            #gather .tsv files and transform them into .npy
-            for func_root in func_dirs:
-                pattern = f"*{config.parcellation_suffix}*.tsv"
-                for tsv_path in func_root.rglob(pattern):
-                    arr = np.loadtxt(tsv_path, delimiter="\t")
-                    
-                    # Assume shape is [n_roi, time] based on your __getitem__
-                    # Z-normalize per ROI across the entire time run
-                    mean_roi = np.mean(arr, axis=1, keepdims=True)
-                    std_roi = np.std(arr, axis=1, keepdims=True)
-                    arr_norm = (arr - mean_roi) / (std_roi + 1e-8)
-                    
-                    np.save(tsv_path.with_suffix(".npy"), arr_norm)
-                    print(f"OK (Z-scored): {tsv_path}")
+        if self.config.use_parcellation == True:
+            tsv_files = [
+                p for p in DATA_ROOT.rglob(f"*{self.config.parcellation_suffix}*.tsv")
+                if not p.with_suffix(".npy").exists()
+            ]
+            with ProcessPoolExecutor() as executor:
+                futures = {executor.submit(_convert_tsv, p): p for p in tsv_files}
+                for future in tqdm(as_completed(futures), total=len(tsv_files), desc="tsv->npy"):
+                    future.result()
         else:
-            #without parcellation we must extract raw fmri data
-            func_preproc_dirs = func_dirs.glob("func_preproc")
-            for dir in func_preproc_dirs:
-                pattern = f"{config.no_parcellation_prefix}*.nii.gz"
-                for file in dir.rglob(pattern):
-                    img = nib.load(file)
-                    data = img.get_fdata()
+            scaling_factor = self.config.orig_fmri_res / self.config.target_fmri_res
 
-                    # Assume shape is [X, Y, Z, time] based on your __getitem__
-                    # Z-normalize per voxel across the entire time run
-                    mean_vox = np.mean(data, axis=3, keepdims=True)
-                    std_vox = np.std(data, axis=3, keepdims=True)
-                    data_norm = (data - mean_vox) / (std_vox + 1e-8)
-
-                    np.save(file.with_suffix(".npy"), data_norm)
-                    print(f"OK (Z-scored): {file.name}")
+            nii_files = [
+                f for func_dir in func_dirs
+                for f in func_dir.rglob(f"{self.config.no_parcellation_prefix}*.nii.gz")
+                if not f.with_suffix("").with_suffix(".npy").exists()
+            ]
+            for f in tqdm(nii_files, desc="nii.gz->npy"):
+                _convert_nii((f, scaling_factor))
 
         # --- 2. EEG PREPROCESSING & NORMALIZATION ---
         eeg_dirs = DATA_ROOT.glob("sub-*/ses-*/eeg")
@@ -177,22 +175,9 @@ class SimultEEG_fMRI(Dataset):
                 if "checkeroff" in file_path.name or "checkerout" in file_path.name or "checker_recording" in file_path.name:
                     continue
                 
-                bandpass_filter(file_path, config.lower_freq, config.higher_freq)
+                bandpass_filter(file_path, self.config.lower_freq, self.config.higher_freq)
+                downsample_eeg(file_path, self.config.target_eeg_freq)
                 save_as_npy(file_path)
-                
-                # Load the newly created .npy to apply Z-normalization
-                npy_path = file_path.with_suffix(".npy")
-                if npy_path.exists():
-                    eeg_data = np.load(npy_path)
-                    
-                    # Assume shape is [n_ch, time]
-                    # Z-normalize per channel across the entire recording
-                    mean_ch = np.mean(eeg_data, axis=1, keepdims=True)
-                    std_ch = np.std(eeg_data, axis=1, keepdims=True)
-                    eeg_norm = (eeg_data - mean_ch) / (std_ch + 1e-8)
-                    
-                    np.save(npy_path, eeg_norm)
-                    print(f"OK (Filtered & Z-scored): {npy_path.name}")
 
     def __getitem__(self, idx):
         pair_id, tr_idx = self.index[idx]
@@ -201,26 +186,30 @@ class SimultEEG_fMRI(Dataset):
         fmri = np.load(info["fmri_path"], mmap_mode="r")  #[n_roi, t] or [x,y,z,t]
         eeg = np.load(info["eeg_path"], mmap_mode="r")    #[n_ch, t]
         
-        t_fmri = tr_idx * self.tr
+        t_fmri = tr_idx * self.config.tr
 
         #getting previous eeg window(accounting hrf_shift) prior to fmri window
-        t_center = t_fmri - self.hrf_shifts_sec
+        ts_eeg = t_fmri - np.array(self.config.hrf_shifts_sec)
 
         eeg_windows = [];
 
-        if config.use_parcellation:
-            fmri_tr = np.array(fmri[:, tr_idx], dtype=np.float32)
+        fmri_start = tr_idx
+        fmri_end = int(tr_idx + np.ceil(self.config.eeg_win_sec / self.config.tr))
+
+        print(fmri_start)
+        print(fmri_end)
+        print(type(fmri_end))
+
+        if self.config.use_parcellation:
+            fmri_tr = np.array(fmri[:, fmri_start:fmri_end], dtype=np.float32)
         else:
-            fmri_tr = np.array(fmri_tr[:, :, :, tr_idx], dtype=np.float32)
+            fmri_tr = np.array(fmri[:, :, :, fmri_start:fmri_end], dtype=np.float32)
 
-        n_samples = int(self.eeg_win_sec * self.eeg_sr)
-        n_ch = self.n_eeg_channels
+        n_samples = int(self.config.eeg_win_sec * self.config.eeg_sr)
+        n_ch = self.config.n_eeg_channels
         
-        for center in t_center:          
-            half = 0.5 * self.eeg_win_sec
-            t_start = center - half
-
-            ind_start = int(round(t_start * self.eeg_sr))
+        for t_eeg in ts_eeg:
+            ind_start = int(round(t_eeg * self.config.eeg_sr))
             ind_end = ind_start + n_samples
 
             eeg_win = np.array(eeg[:, ind_start:ind_end], dtype=np.float32)
@@ -239,12 +228,12 @@ class SimultEEG_fMRI(Dataset):
             
         sample = {
             "eeg": eeg_windows,               #[K, C, T]
-            "fmri": fmri_tr,              #[R]
+            "fmri": fmri_tr,              #[R, T] or [X,Y,Z,T]
             "tr_idx": int(tr_idx),
             "sub": info["sub"],
             "ses": info["ses"],
             "t_fmri": float(t_fmri),
-            "t_eeg_centers": t_center,
+            "ts_eeg": ts_eeg,
         }
         return sample
 

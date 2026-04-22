@@ -13,7 +13,7 @@ def setup_full_reinit_model():
     new_channels = 64
     
     # [!] Load your pre-trained weights here
-    # model.load_state_dict(torch.load("biot_pretrained_16ch.pth"))
+    model.load_state_dict(torch.load("../BIOT/pretrained-models/biot_pretrained_16ch.pth"))
     
     # 2. Completely overwrite the channel embedding layer for 64 channels
     model.channel_tokens = nn.Embedding(new_channels, 256)
