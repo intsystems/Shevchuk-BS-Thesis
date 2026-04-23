@@ -1,6 +1,3 @@
-[submodule "BIOT"]
-	path = BIOT
-	url = git@github.com:ycq091044/BIOT.git
 [submodule "NeuroSTORM"]
 	path = NeuroSTORM
 	url = https://github.com/CUHK-AIM-Group/NeuroSTORM.git
