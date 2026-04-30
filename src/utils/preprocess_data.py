@@ -145,6 +145,75 @@ def preprocess_eeg(set_path: Path, config: TrainConfig) -> np.ndarray:
     np.save(npy_path, data)                     # overwrite with z-normed version
     return data
 
+def _eeg_qc_plot(set_path: Path, config: TrainConfig, sub_id: str, activity: str):
+    import matplotlib.pyplot as plt
+    from scipy.signal import welch
+    import mne
+
+    raw = mne.io.read_raw_eeglab(str(set_path), preload=True)
+    raw_sr = int(raw.info["sfreq"])
+    picks = mne.pick_types(raw.info, eeg=True)
+    raw_data = raw.get_data(picks=picks).astype(np.float32)  # (C, T)
+
+    preprocess_eeg(set_path, config)
+    proc_data = np.load(set_path.with_suffix(".npy")).astype(np.float32)  # (C, T)
+    proc_sr = config.data.eeg_sr
+
+    ch_mean_raw  = raw_data.mean(axis=-1)
+    ch_std_raw   = raw_data.std(axis=-1)
+    ch_mean_proc = proc_data.mean(axis=-1)
+    ch_std_proc  = proc_data.std(axis=-1)
+
+    print(f"\n=== EEG QC  {sub_id}/{activity} ===")
+    print(f"Raw  — mean: [{ch_mean_raw.min():.3e}, {ch_mean_raw.max():.3e}]  "
+          f"std: [{ch_std_raw.min():.3e}, {ch_std_raw.max():.3e}]")
+    print(f"Proc — mean: [{ch_mean_proc.min():.4f}, {ch_mean_proc.max():.4f}]  "
+          f"std: [{ch_std_proc.min():.4f}, {ch_std_proc.max():.4f}]")
+
+    f_raw,  pxx_raw  = welch(raw_data[0],  fs=raw_sr,  nperseg=raw_sr)
+    f_proc, pxx_proc = welch(proc_data[0], fs=proc_sr, nperseg=proc_sr)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+
+    # PSD before
+    axes[0, 0].semilogy(f_raw, pxx_raw, lw=0.8)
+    axes[0, 0].axvline(config.data.lower_freq,  color="r", ls="--", label=f"{config.data.lower_freq} Hz")
+    axes[0, 0].axvline(config.data.higher_freq, color="g", ls="--", label=f"{config.data.higher_freq} Hz")
+    axes[0, 0].set_xlim(0, min(raw_sr / 2, 150))
+    axes[0, 0].set_title(f"PSD before  (sr={raw_sr} Hz)")
+    axes[0, 0].set_xlabel("Frequency (Hz)")
+    axes[0, 0].set_ylabel("Power (V²/Hz)")
+    axes[0, 0].legend()
+
+    # PSD after
+    axes[0, 1].semilogy(f_proc, pxx_proc, lw=0.8, color="orange")
+    axes[0, 1].axvline(config.data.lower_freq,  color="r", ls="--")
+    axes[0, 1].axvline(config.data.higher_freq, color="g", ls="--")
+    axes[0, 1].set_xlim(0, proc_sr / 2)
+    axes[0, 1].set_title(f"PSD after  (sr={proc_sr} Hz, z-normed)")
+    axes[0, 1].set_xlabel("Frequency (Hz)")
+
+    # per-channel mean
+    ch_idx = np.arange(len(ch_mean_proc))
+    axes[1, 0].bar(ch_idx, ch_mean_proc)
+    axes[1, 0].axhline(0, color="r", lw=1)
+    axes[1, 0].set_title("Per-channel mean after (should be ~0)")
+    axes[1, 0].set_xlabel("Channel")
+
+    # per-channel std
+    axes[1, 1].bar(ch_idx, ch_std_proc, color="orange")
+    axes[1, 1].axhline(1, color="r", lw=1)
+    axes[1, 1].set_title("Per-channel std after (should be ~1)")
+    axes[1, 1].set_xlabel("Channel")
+
+    fig.suptitle(f"EEG QC  —  {sub_id} / {activity}", fontsize=12)
+    plt.tight_layout()
+    out = f"eeg_qc_{sub_id}.png"
+    plt.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[QC] saved {out}")
+
+
 def preprocess_dataset(config: TrainConfig):
     dataset_path = Path(config.data.data_dir)
 
@@ -157,6 +226,8 @@ def preprocess_dataset(config: TrainConfig):
                 fmri_files = list((dataset_path / sub_id).rglob("*" + config.data.parcellation_suffix + ".nii.gz"))
             else:
                 fmri_files = list((dataset_path / sub_id).rglob(config.data.no_parcellation_prefix + "*.nii.gz"))
+
+            first_eeg_done = False
 
             for f_path in tqdm(fmri_files, desc=f"{sub_id}"):
                 if any(excl in f_path.parents[1].name for excl in config.data.excluded_activities):
@@ -180,6 +251,11 @@ def preprocess_dataset(config: TrainConfig):
                     task_name = f_path.parents[1].name.replace("_bold", "")
                     eeg_npy = f_path.parents[3] / "eeg" / f"{task_name}_eeg.npy"
                     eeg_set = eeg_npy.with_suffix(".set")
+
+                    if not first_eeg_done:
+                        _eeg_qc_plot(eeg_set, config, sub_id, activity)
+                        first_eeg_done = True
+
                     preprocess_eeg(eeg_set, config)
                     eeg_data = np.load(eeg_npy).astype(np.float16).T  # (T_eeg, C)
 
