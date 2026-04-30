@@ -149,7 +149,7 @@ def preprocess_eeg(set_path: Path, config: TrainConfig) -> np.ndarray:
 
 def preprocess_dataset(config: TrainConfig):
     for i in range(config.data.start_sub, config.data.end_sub + 1):
-        download_natview_subjects(start_sub=i, end_sub=i, out_dir=config.data.data_dir)
+        download_natview_subjects(start_sub=i, end_sub=i)
 
         dataset_path = Path(config.data.data_dir)
 
@@ -167,7 +167,14 @@ def preprocess_dataset(config: TrainConfig):
 
                 sub_id = f_path_p[0]
                 activity = f_path_p[3].split("_")
-                activity = activity[2] + "_" + activity[3] if "run" in activity[3] else activity[2]
+
+                task_part = activity[2:3] # Всегда список: ['task-name'] или []
+                run_part = activity[3:4]  # Всегда список: ['run-01'] или []
+
+                if run_part and "run" in run_part[0]:
+                    activity = "_".join(task_part + run_part)
+                else:
+                    activity = task_part[0] if task_part else "unknown_task"
 
                 print(activity)
                 print(sub_id)     
@@ -208,37 +215,30 @@ def download_natview_subjects(
     base_url="https://fcp-indi.s3.amazonaws.com/data/Projects/NATVIEW_EEGFMRI/preproc_data_gz"
 ):
     """
-    Downloads NATVIEW EEG-fMRI dataset for subjects sub-01 ... sub-22
+    Downloads NATVIEW EEG-fMRI dataset for subjects sub-01 ... sub-22.
 
-    Arguments:
-    start(int) - first subject index (default: 1)
-    end(int) - last subject index (default: 22)
-    out_dir(str) - directory to save downloaded files
-    base_url(str) - base URL of dataset
+    Archives contain paths like  projects/EEG_FMRI/data_indi_preproc/sub-XX/...
+    Extracting into out_dir="data" produces  data/projects/EEG_FMRI/data_indi_preproc/sub-XX/...
+    which matches config.data.data_dir.
     """
-
     os.makedirs(out_dir, exist_ok=True)
+    data_dir = Path(out_dir) / "projects" / "EEG_FMRI" / "data_indi_preproc"
 
     for i in range(start_sub, end_sub + 1):
         sub_id = f"sub-{i:02d}"
-        url = f"{base_url}/{sub_id}.tar.gz"
-        out_path = os.path.join(out_dir, f"{sub_id}.tar.gz")
-
-        sub_dir = os.path.join(out_dir, sub_id)
-        if os.path.exists(sub_dir):
-            print(f"[SKIP] {sub_id} already downloaded")
+        if (data_dir / sub_id).exists():
+            print(f"[SKIP] {sub_id}")
             continue
+
+        url = f"{base_url}/{sub_id}.tar.gz"
+        tar_path = Path(out_dir) / f"{sub_id}.tar.gz"
 
         print(f"[DOWNLOAD] {sub_id}")
         response = requests.get(url, stream=True)
         response.raise_for_status()
-
         total_size = int(response.headers.get("content-length", 0))
-        with open(out_path, "wb") as f, tqdm(
-            total=total_size,
-            unit="B",
-            unit_scale=True,
-            desc=sub_id
+        with open(tar_path, "wb") as f, tqdm(
+            total=total_size, unit="B", unit_scale=True, desc=sub_id
         ) as pbar:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
@@ -246,37 +246,28 @@ def download_natview_subjects(
                     pbar.update(len(chunk))
 
         print(f"[EXTRACT] {sub_id}")
-        with tarfile.open(out_path, "r:gz") as tar:
+        with tarfile.open(tar_path, "r:gz") as tar:
             tar.extractall(path=out_dir)
-        os.remove(out_path)
-        print(f"[DELETED] {sub_id}.tar.gz")
+        tar_path.unlink()
+        print(f"[DONE] {sub_id}")
 
-def extract_all_tar_gz(data_dir="data"):
-    os.makedirs(data_dir, exist_ok=True)
-    for fname in os.listdir(data_dir):
-        if fname.endswith(".tar.gz"):
-            path = os.path.join(data_dir, fname)
-            print(f"[EXTRACT] {fname}")
-            try:
-                with tarfile.open(path, "r:gz") as tar:
-                    for member in tar.getmembers():
-                        try:
-                            # Create parent directories before extracting
-                            if member.isfile():
-                                member_path = os.path.join(data_dir, member.name)
-                                member_dir = os.path.dirname(member_path)
-                                os.makedirs(member_dir, exist_ok=True)
-                                # Extract individual file
-                                tar.extract(member, path=data_dir)
-                            elif member.isdir():
-                                member_path = os.path.join(data_dir, member.name)
-                                os.makedirs(member_path, exist_ok=True)
-                        except Exception as e:
-                            print(f"  [WARN] Ошибка при извлечении {member.name}: {e}")
-                            continue
-            except Exception as e:
-                print(f"  [ERROR] Ошибка при открытии {fname}: {e}")
-                continue
+
+def extract_all_tar_gz(out_dir="data"):
+    """
+    Extracts all *.tar.gz in out_dir.
+    Archives must contain paths starting with projects/EEG_FMRI/data_indi_preproc/sub-XX/...
+    so files land at out_dir/projects/EEG_FMRI/data_indi_preproc/sub-XX/...
+    """
+    for fname in os.listdir(out_dir):
+        if not fname.endswith(".tar.gz"):
+            continue
+        tar_path = os.path.join(out_dir, fname)
+        print(f"[EXTRACT] {fname}")
+        try:
+            with tarfile.open(tar_path, "r:gz") as tar:
+                tar.extractall(path=out_dir)
+        except Exception as e:
+            print(f"  [ERROR] {fname}: {e}")
 
 if __name__ == "__main__":
     config = TrainConfig()
