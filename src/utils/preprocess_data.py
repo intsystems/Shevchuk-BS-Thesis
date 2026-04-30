@@ -5,6 +5,13 @@ import requests
 from tqdm import tqdm
 import tarfile
 import torch
+import torch.nn.functional as F
+import nibabel as nib
+from nilearn import image
+from train.config import TrainConfig
+from pathlib import Path
+import h5py
+import shutil
 
 #FOR NATVIEW DATASET
 
@@ -43,61 +50,156 @@ def save_as_npy(filename):
     out_path = filename.with_suffix(".npy")
     np.save(out_path, eeg_data.astype(np.float32))
 
-def transform_to_neurostorm_space(fmri_volume: np.ndarray, scaling_factor: float = 1.5) -> np.ndarray:
+#copied from https://github.com/CUHK-AIM-Group/NeuroSTORM/blob/main/datasets/preprocessing_volume.py
+def select_middle_96(vector):
+    start_index, end_index = [], []
+
+    #padding to 96 cube
+    sizes = np.expand_dims(np.flip(vector.shape[:3]), axis=-1)
+
+    sizes = np.hstack([sizes, sizes]).reshape(6)
+
+    padding = tuple([0,0] + [(96 - dim) // 2 for dim in sizes] if len(vector.shape) == 4 else [(96 - dim) // 2 for dim in sizes])
+    
+    vector = F.pad(torch.from_numpy(vector), pad=padding)
+
+    for i in range(3):
+        if vector.shape[i] > 96:
+            start_index.append((vector.shape[i] - 96) // 2)
+            end_index.append(start_index[-1] + 96)
+        else:
+            start_index.append(0)
+            end_index.append(vector.shape[i])
+
+    if len(vector.shape) == 3:
+        result = vector[start_index[0]:end_index[0], start_index[1]:end_index[1], start_index[2]:end_index[2]]
+    elif len(vector.shape) == 4:
+        result = vector[start_index[0]:end_index[0], start_index[1]:end_index[1], start_index[2]:end_index[2], :]
+    
+    return result
+
+def spatial_resampling(data, header, target_voxel_size=(2, 2, 2)):
+    current_voxel_size = header.get_zooms()[:3]
+    scale_factors = [current / target for current, target in zip(current_voxel_size, target_voxel_size)]
+    new_dims = [int(np.round(dim * scale)) for dim, scale in zip(data.shape[:3], scale_factors)]
+    
+    data = data.astype(np.float32)
+    
+    if data.ndim == 4:
+        data_tensor = torch.from_numpy(data).permute(3, 0, 1, 2).unsqueeze(1)
+    elif data.ndim == 3:
+        data_tensor = torch.from_numpy(data).unsqueeze(0).unsqueeze(0)
+    
+    resampled_tensor = F.interpolate(data_tensor, size=new_dims, mode='trilinear', align_corners=False)
+    
+    if data.ndim == 4:
+        resampled_data = resampled_tensor.squeeze(1).permute(1, 2, 3, 0).numpy()
+    else:
+        resampled_data = resampled_tensor.squeeze(0).squeeze(0).numpy()
+    
+    return resampled_data
+
+def preprocess_fmri(path_to_file: str, config: TrainConfig):
     """
-    Апсемплинг fMRI с шага 3мм до 2мм и приведение к кубу 96x96x96.
-    Ожидает на входе numpy массив формы (61, 73, 61, T).
+    path_to_file : MNI-registered 4D fMRI (X, Y, Z, T)
+
+    Brain mask is derived directly from the MNI volume: after MNI registration
+    background voxels are exactly zero across all TRs.
     """
-    # 1. Конвертация и перестановка в формат, который требует F.interpolate
-    # (Batch, Channel, Depth, Height, Width) -> (T, 1, X, Y, Z)
-    x = torch.tensor(fmri_volume, dtype=torch.float32)
-    x = x.permute(3, 0, 1, 2).unsqueeze(1) 
-    
-    # 2. Пространственное ресемплирование (3mm -> 2mm)
-    # Коэффициент масштабирования = 3/2 = 1.5. 
-    # Размер 61x73x61 превратится примерно в 92x110x92
-    x_resampled = F.interpolate(
-        x, 
-        scale_factor=scaling_factor, 
-        mode='trilinear', 
-        align_corners=False
-    )
-    
-    _, _, new_X, new_Y, new_Z = x_resampled.shape
-    target = 96
-    
-    # 3. Симметричный Padding (Дополнение нулями там, где < 96)
-    # F.pad принимает отступы с конца: (Z_left, Z_right, Y_left, Y_right, X_left, X_right)
-    pad_Z_left = max((target - new_Z) // 2, 0)
-    pad_Z_right = max(target - new_Z - pad_Z_left, 0)
-    
-    pad_Y_left = max((target - new_Y) // 2, 0)
-    pad_Y_right = max(target - new_Y - pad_Y_left, 0)
-    
-    pad_X_left = max((target - new_X) // 2, 0)
-    pad_X_right = max(target - new_X - pad_X_left, 0)
-    
-    x_padded = F.pad(
-        x_resampled, 
-        (pad_Z_left, pad_Z_right, pad_Y_left, pad_Y_right, pad_X_left, pad_X_right), 
-        mode='constant', 
-        value=0.0  # Нули сработают как нейтральный фон для NeuroSTORM
-    )
-    
-    # 4. Center Crop (Обрезка лишнего там, где > 96, например по оси Y)
-    crop_X_start = max((x_padded.shape[2] - target) // 2, 0)
-    crop_Y_start = max((x_padded.shape[3] - target) // 2, 0)
-    crop_Z_start = max((x_padded.shape[4] - target) // 2, 0)
-    
-    x_final = x_padded[
-        :, :,
-        crop_X_start : crop_X_start + target,
-        crop_Y_start : crop_Y_start + target,
-        crop_Z_start : crop_Z_start + target
-    ]
-    
-    # 5. Возврат к исходному формату (X, Y, Z, T) для сохранения на диск
-    return x_final.squeeze(1).permute(1, 2, 3, 0).numpy()
+    img = nib.load(path_to_file)
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    header = img.header
+
+    data = spatial_resampling(data, header, target_voxel_size=config.data.target_voxel_size)
+    data = select_middle_96(data).numpy()           # (96, 96, 96, T)
+
+    # brain mask: voxels that are non-zero in at least one TR
+    # MNI registration leaves background exactly 0
+    brain_mask = (data != 0).any(axis=-1)           # (96, 96, 96) bool
+
+    # z-normalize using only brain voxels (preserves negative BOLD values)
+    brain_vals = data[brain_mask]
+    mu  = brain_vals.mean()
+    std = brain_vals.std()
+    data[brain_mask] = (data[brain_mask] - mu) / (std + 1e-8)
+    # background stays 0
+
+    return torch.from_numpy(data).to(torch.float16)  # (96, 96, 96, T)
+
+def preprocess_eeg(set_path: Path, config: TrainConfig) -> np.ndarray:
+    """
+    set_path : path to .set EEGLab file
+    Returns  : (C, T) float32 array, z-normalized per channel
+    """
+    bandpass_filter(set_path, config.data.lower_freq, config.data.higher_freq)
+    downsample_eeg(set_path, config.data.target_eeg_freq)
+    save_as_npy(set_path)                       # saves to set_path.with_suffix('.npy')
+
+    npy_path = set_path.with_suffix(".npy")
+    data = np.load(npy_path).astype(np.float32) # (C, T)
+
+    mean = data.mean(axis=-1, keepdims=True)
+    std  = data.std(axis=-1, keepdims=True)
+    data = (data - mean) / (std + 1e-8)
+
+    print(np.mean(data, axis=-1))
+
+    np.save(npy_path, data)                     # overwrite with z-normed version
+    return data
+
+def preprocess_dataset(config: TrainConfig):
+    for i in range(config.data.start_sub, config.data.end_sub + 1):
+        download_natview_subjects(start_sub=i, end_sub=i, out_dir=config.data.data_dir)
+
+        dataset_path = Path(config.data.data_dir)
+
+        if config.data.use_parcellation:
+            fmri_files = dataset_path.rglob("*" + config.data.parcellation_suffix + ".nii.gz")
+        else:
+            fmri_files = dataset_path.rglob(config.data.no_parcellation_prefix + "*.nii.gz")
+
+        with h5py.File(config.data.output_h5, 'w') as h5f:
+            for f_path in tqdm(fmri_files, desc="Конвертация в H5"):
+                if any(excluded_activity in f_path.parents[1].name for excluded_activity in config.data.excluded_activities):
+                    continue
+
+                f_path_p = f_path.relative_to(config.data.data_dir).parts
+
+                sub_id = f_path_p[0]
+                activity = f_path_p[3].split("_")
+                activity = activity[2] + "_" + activity[3] if "run" in activity[3] else activity[2]
+
+                print(activity)
+                print(sub_id)     
+
+                try:
+                    # fMRI: resample + crop + z-norm → (T, 96, 96, 96)
+                    fmri_data = preprocess_fmri(f_path, config)
+                    fmri_data = fmri_data.to(torch.float16).permute(3, 0, 1, 2)
+
+                    task_name = f_path.parents[1].name.replace("_bold", "")
+                    eeg_npy = f_path.parents[3] / "eeg" / f"{task_name}_eeg.npy"
+                    eeg_set = eeg_npy.with_suffix(".set")
+                    preprocess_eeg(eeg_set, config)
+                    eeg_data = torch.Tensor(np.load(eeg_npy).astype(np.float16).T)  # (T_eeg, C)
+
+                    grp = f"{sub_id}/{activity}"
+                    if f"{grp}/fmri" not in h5f:
+                        fmri_win_trs = int(np.ceil(config.data.eeg_win_sec / config.data.tr))
+                        h5f.create_dataset(f"{grp}/fmri", data=fmri_data,
+                                        chunks=(fmri_win_trs, 96, 96, 96),
+                                        compression="gzip", compression_opts=4)
+                    if f"{grp}/eeg" not in h5f:
+                        eeg_win_samples = int(config.data.eeg_win_sec * config.data.eeg_sr)
+                        h5f.create_dataset(f"{grp}/eeg", data=eeg_data,
+                                        chunks=(eeg_win_samples, eeg_data.shape[1]),
+                                        compression="gzip", compression_opts=4)
+
+                except Exception as e:
+                    print(f"Ошибка в файле {f_path}: {e}")
+        
+        shutil.rmtree(dataset_path)
+
 
 def download_natview_subjects(
     start_sub=1,
@@ -175,3 +277,8 @@ def extract_all_tar_gz(data_dir="data"):
             except Exception as e:
                 print(f"  [ERROR] Ошибка при открытии {fname}: {e}")
                 continue
+
+if __name__ == "__main__":
+    config = TrainConfig()
+
+    preprocess_dataset(config)

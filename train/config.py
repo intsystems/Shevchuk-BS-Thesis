@@ -21,29 +21,38 @@ class eegAug:
 class DataConfig:
     data_dir: str = "data/projects/EEG_FMRI/data_indi_preproc/"
     #dataset params
+    dataset_name: str = "natview"
     eeg_sr: int = 200
-    tr: float = 2.1
-    eeg_win_sec: int = 2
+    tr: float = 2.1 #sampling rate of fmri, in sec
+    eeg_win_sec: int = 15 #window size, for eeg and fmri, in sec
     hrf_shifts_sec: list = field(default_factory=lambda: [4.2])
-    stride_tr: int = 1
+    stride_tr: int = 1 #shift inside one activity, in trs
     n_eeg_channels: int = 60
+    ch_names: list = field(default_factory=lambda: ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T7', 'T8', 'P7', 'P8', 'Fz', 'Cz', 'Pz', 'Oz', 'FC1', 'FC2', 'CP1', 'CP2', 'FC5', 'FC6', 'CP5', 'CP6', 'TP9', 'TP10', 'POz', 'F1', 'F2', 'C1', 'C2', 'P1', 'P2', 'AF3', 'AF4', 'FC3', 'CP3', 'CP4', 'PO3', 'PO4', 'F5', 'F6', 'C5', 'C6', 'P5', 'P6', 'AF7', 'AF8', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8', 'Fpz', 'CPz'])
+    start_sub: int = 1
+    end_sub: int = 22
+    base_url: str = "https://fcp-indi.s3.amazonaws.com/data/Projects/NATVIEW_EEGFMRI/preproc_data_gz"
 
     #peprocessing settings (dataset specific)
     use_parcellation: bool = False
     parcellation_suffix: str = "space-MNI152Lin_res-3mm_atlas-Schaefer2018_dens-200parcels7networks_desc-sm0_bold"
-    no_parcellation_prefix:str = "func_pp_nofilt"
+    no_parcellation_prefix:str = "func_pp_nofilt_sm0"
     lower_freq:float = 0.5
     higher_freq:float = 45
     target_eeg_freq:int = 200
-    orig_fmri_res: int = 3
-    target_fmri_res: int = 2
+    target_voxel_size:tuple = (2, 2, 2) #in mm
+    excluded_activities: list = field(default_factory=lambda: ["task-checker", "task-rest", "task-peer"])
+    fill_zeroback: bool = False
+    output_h5: str = "dataset.h5"
 
     #augmentations settings
     eeg_aug: eegAug = field(default_factory=eegAug)
     fmri_aug: fmriAug = field(default_factory=fmriAug)
 
     #batch sampler settings:
-
+    num_timestamps: int = 8 #number of timesteps inside activity used in batch
+    num_subjects: int = 16 #number of subject per activity
+    margin_tr: int = 15 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation) 
 
 @dataclass
 class ModelConfig:
@@ -51,6 +60,14 @@ class ModelConfig:
     n_eeg_channels: int = 64
     n_eeg_times: int = 500  # eeg_win_sec * eeg_sr
     n_roi: int = 200  # Schaefer 200 parcellation
+
+    #Labram output is [B, 200], [CLS] token embedding
+    Labram_out_dim: int = 200
+    labram_pretrained: bool = True
+
+    #Neurostorm output is (B, 288, 2, 2, 2, T)
+    Neurostorm_ckpt: str = ""
+    Neurostorm_out_dim: int = 288
 
     projector_hidden_dim: int = 256
     projector_out_dim: int = 128

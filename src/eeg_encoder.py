@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
-from BIOT.model.biot import BIOTEncoder
 from src.utils.shared_layers import Projector
 from train.config import TrainConfig
+from braindecode.models import Labram
+
+Labram_OUT_DIM = 200
 
 class EEGAugmentor:
     def __init__(self, config: TrainConfig):
@@ -102,55 +105,50 @@ class EEGAugmentor:
 
         return x * amp
 
-class EEGEncoderBIOT(nn.Module):
-    def __init__(
-        self,
-        n_channels: int = 60,
-        emb_size: int = 256,
-        heads: int = 8,
-        depth: int = 4,
-        n_fft: int = 200,
-        hop_length: int = 100,
-        proj_dim: int = 128,
-    ):
+class EEGProjectionHead(nn.Module):
+    def __init__(self, config: TrainConfig):
         super().__init__()
-        self.encoder = BIOTEncoder(
-            emb_size=emb_size,
-            heads=heads,
-            depth=depth,
-            n_channels=n_channels,
-            n_fft=n_fft,
-            hop_length=hop_length,
-        )
-        self.proj = Projector(emb_size, proj_dim)
+        # 2-слойный MLP
+        self.mlp = Projector(config, in_dim=config.model.Labram_out_dim)
 
     def forward(self, x):
         """
-        x: [B, C, T]
-        returns: [B, proj_dim]
+        Вход: (B, L, 200), где L - количество токенов времени (T / sr)
         """
-        x = self.encoder(x)
-        x = self.proj(x)
-        return x
 
-    def load_pretrained(self, path: str):
+        return self.mlp(x) # Ожидаемый выход: (B, 256)
+
+class EEGEncoder(nn.Module):
+    """
+    EEG encoder: LaBraM backbone → CLS token → Projector → L2-normalized embedding.
+
+    Args:
+        ch_names:     list of channel name strings matching the input EEG data
+        proj_out_dim: output embedding dimensionality
+        pretrained:   if True, load braindecode/labram-pretrained weights
+    """
+    def __init__(self, config: TrainConfig):
+        super().__init__()
+        self.ch_names = config.data.ch_names
+        n_chans = len(self.ch_names)
+
+        if config.model.labram_pretrained:
+            self.backbone = Labram.from_pretrained("braindecode/labram-pretrained")
+        else:
+            self.backbone = Labram(
+                n_chans=n_chans,
+                n_times=400,
+                sfreq=200,
+                n_outputs=2,
+            )
+
+        self.projector = Projector(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Load pretrained BIOT weights.
-        channel_tokens and index are dropped — they are sensor-layout-specific
-        and will be trained from scratch for the target montage.
+        x: (B, C, T)
+        returns: (B, proj_out_dim)  L2-normalized
         """
-        state = torch.load(path, map_location="cpu")
-
-        # Some checkpoints nest weights under 'biot.' prefix
-        if any(k.startswith("biot.") for k in state):
-            state = {k[len("biot."):]: v for k, v in state.items() if k.startswith("biot.")}
-
-        # Drop sensor-layout-specific weights — keep them randomly initialized
-        state.pop("channel_tokens.weight", None)
-        state.pop("index", None)
-
-        missing, unexpected = self.encoder.load_state_dict(state, strict=False)
-        print(f"Loaded pretrained BIOT weights from {path}")
-        print(f"  Missing (reinitialized): {missing}")
-        if unexpected:
-            print(f"  Unexpected keys: {unexpected}")
+        feat = self.backbone(x, ch_names=self.ch_names, return_features=True)
+        cls = feat["cls_token"]          # (B, 200)
+        return self.projector(cls)       # (B, proj_out_dim)

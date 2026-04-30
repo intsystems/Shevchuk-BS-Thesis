@@ -8,7 +8,8 @@ import unittest
 import torch.nn.functional as F 
 from train.config import TrainConfig
 from src.utils.preprocess_data import extract_all_tar_gz
-from src.utils.dataset import SimultEEG_fMRI
+from src.utils.dataset import SimultEEG_fMRI, ContrastiveBatchSampler, collate_fn
+from torch.utils.data import DataLoader
 
 import pandas as pd
 
@@ -177,128 +178,317 @@ def test_neurostorm_transform():
     assert not np.isnan(transformed).any(), "NaN in output"
     print("All checks passed.")
 
-def test_neurostorm_encoder():
-    """
-    Tests that NeuroSTORM MAE encoder loads correctly from checkpoint
-    and produces expected output shape from a random (1, 1, 96, 96, 96, 20) input.
 
-    Run from the repo root:
-        python -m src.test
-
-    Requires: mamba_ssm, monai, einops  (available in Colab with GPU)
-    """
-    import sys
-    import os
+def test_labram_raw():
+    from braindecode.models import Labram
     import torch
 
-    # Add NeuroSTORM repo to path so its internal imports resolve
-    neurostorm_root = os.path.join(os.path.dirname(__file__), "..", "NeuroSTORM")
-    sys.path.insert(0, os.path.abspath(neurostorm_root))
+    ch_names = ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2',
+                'F7', 'F8', 'T7', 'T8', 'P7', 'P8', 'Fz', 'Cz', 'Pz', 'Oz',
+                'FC1', 'FC2', 'CP1', 'CP2', 'FC5', 'FC6', 'CP5', 'CP6', 'TP9', 'TP10',
+                'POz', 'F1', 'F2', 'C1', 'C2', 'P1', 'P2', 'AF3', 'AF4', 'FC3',
+                'CP3', 'CP4', 'PO3', 'PO4', 'F5', 'F6', 'C5', 'C6', 'P5', 'P6',
+                'AF7', 'AF8', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8', 'Fpz', 'CPz']
 
-    from models.neurostorm import NeuroSTORMMAE
+    B, C, T = 2, len(ch_names), 3200  # 30 sec * 200 Hz
 
-    CKPT_PATH = os.path.join(os.path.dirname(__file__), "pt_neurostorm_mae_ratio0.5.ckpt")
-
-    print("Loading checkpoint...")
-    ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
-    hp = ckpt["hyper_parameters"]
-
-    print(f"  img_size      : {hp['img_size']}")
-    print(f"  patch_size    : {hp['patch_size']}")
-    print(f"  embed_dim     : {hp['embed_dim']}")
-    print(f"  depths        : {hp['depths']}")
-    print(f"  mask_ratio    : {hp['mask_ratio']}")
-    print(f"  spatial_mask  : {hp['spatial_mask']}")
-    print(f"  time_mask     : {hp['time_mask']}")
-
-    print("\nBuilding NeuroSTORMMAE...")
-    model = NeuroSTORMMAE(
-        img_size=hp["img_size"],
-        in_chans=hp["in_chans"],
-        embed_dim=hp["embed_dim"],
-        window_size=hp["window_size"],
-        first_window_size=hp["first_window_size"],
-        patch_size=hp["patch_size"],
-        depths=hp["depths"],
-        num_heads=hp["num_heads"],
-        c_multiplier=hp["c_multiplier"],
-        last_layer_full_MSA=hp["last_layer_full_MSA"],
-        drop_rate=hp["attn_drop_rate"],
-        drop_path_rate=hp["attn_drop_rate"],
-        attn_drop_rate=hp["attn_drop_rate"],
-        mask_ratio=hp["mask_ratio"],
-        spatial_mask=hp["spatial_mask"],
-        time_mask=hp["time_mask"],
-    )
-
-    # Strip 'model.' prefix added by the LightningModel wrapper
-    sd = ckpt["state_dict"]
-    model_sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
-    missing, unexpected = model.load_state_dict(model_sd, strict=True)
-    assert not missing,    f"Missing keys: {missing}"
-    assert not unexpected, f"Unexpected keys: {unexpected}"
-    print("Weights loaded successfully.")
-
+    print(f"Input: ({B}, {C}, {T})")
+    print("Loading pretrained LaBraM...")
+    model = Labram.from_pretrained("braindecode/labram-pretrained")
     model.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    print(f"Running on: {device}")
 
-    # Input: (B, C, X, Y, Z, T) matching the checkpoint's img_size [96, 96, 96, 20]
-    x = torch.randn(1, 1, 96, 96, 96, 20, device=device)
-    print(f"\nInput  shape : {tuple(x.shape)}")
+    print(model.n_times)
+    print(model.neural_tokenizer)
+    print(model.position_embedding.shape)
+
+    x = torch.randn(B, C, T)
 
     with torch.no_grad():
-        latent, mask = model.forward_encoder(x)
+        out = model(x, ch_names=ch_names, return_features=True)
 
-    print(f"Latent shape : {tuple(latent.shape)}")
-    print(f"Mask   shape : {tuple(mask.shape)}")
-    print(f"Latent mean  : {latent.mean().item():.4f}")
-    print(f"Latent std   : {latent.std().item():.4f}")
-    print(f"Masked tokens: {int(mask.sum().item())} / {mask.numel()}")
-
-    # Expected encoder output: (B, 288, 2, 2, 2, 20) based on architecture comments
-    assert latent.ndim == 6, f"Expected 6-dim latent, got {latent.ndim}"
-    assert latent.shape[0] == 1, "Batch size should be 1"
-    print("\nAll assertions passed.")
+    print("Output keys:", list(out.keys()) if isinstance(out, dict) else type(out))
+    if isinstance(out, dict):
+        for k, v in out.items():
+            print(f"  {k}: {v.shape}")
+    else:
+        print(f"  output shape: {out.shape}")
 
 
-def test_fmri_encoder_volume():
+def test_fmri_preprocessing_steps():
+    import nibabel as nib
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from src.utils.preprocess_data import spatial_resampling, select_middle_96
+
+    NII_PATH = (
+        "data/projects/EEG_FMRI/data_indi_preproc/"
+        "sub-01/ses-01/func/sub-01_ses-01_task-checker_bold/"
+        "func_preproc/func_pp_nofilt_sm0.mni152.3mm.nii.gz"
+    )
+    OUT_PATH = "fmri_preproc_steps.png"
+    T_IDX = 0
+
+    img = nib.load(NII_PATH)
+    raw = np.asarray(img.dataobj, dtype=np.float32)  # (X, Y, Z, T)
+    header = img.header
+    print(f"Raw shape: {raw.shape}, voxel size: {header.get_zooms()[:3]}")
+
+    # Step 1: raw
+    step1 = raw[..., T_IDX]
+
+    # Step 2: spatial resample 3mm → 2mm
+    step2_4d = spatial_resampling(raw, header, target_voxel_size=(2, 2, 2))
+    step2 = step2_4d[..., T_IDX]
+    print(f"After resample: {step2_4d.shape}")
+
+    # Step 3: select_middle_96 (crop/pad to 96x96x96)
+    step3_4d = select_middle_96(step2_4d).numpy()
+    step3 = step3_4d[..., T_IDX]
+    print(f"After select_middle_96: {step3_4d.shape}")
+
+    # Step 4: brain mask derived from MNI volume (background = exactly 0 after MNI reg)
+    brain_mask = (step3_4d != 0).any(axis=-1)  # (96, 96, 96) bool
+    print(f"Brain voxels: {brain_mask.sum()} / {brain_mask.size} ({100*brain_mask.mean():.1f}%)")
+    step4 = brain_mask.astype(np.float32)
+
+    # Step 5: apply mask (zero out background), no clip
+    step5_4d = step3_4d.copy()
+    step5_4d[~brain_mask] = 0
+    step5 = step5_4d[..., T_IDX]
+
+    # Step 6: global z-norm only inside brain, fill background with min
+    brain_vals = step5_4d[brain_mask]
+    mu, sigma = brain_vals.mean(), brain_vals.std()
+    step6_4d = step5_4d.copy()
+    step6_4d[brain_mask] = (step5_4d[brain_mask] - mu) / sigma
+    step6_4d[~brain_mask] = 0
+    step6 = step6_4d[..., T_IDX]
+    print(f"Z-norm: mean={mu:.2f}, std={sigma:.2f}")
+
+    steps = [
+        ("1. Raw (3mm MNI)", step1),
+        ("2. Resampled (2mm)", step2),
+        ("3. select_middle_96", step3),
+        ("4. Zero mask", step4),
+        ("5. Mask applied + clip<0", step5),
+        ("6. Z-normalized", step6),
+    ]
+
+    # --- Figure 1: 6 preprocessing steps (axial only) ---
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    for ax, (title, vol) in zip(axes.flat, steps):
+        cz = vol.shape[2] // 2
+        sl = np.rot90(vol[:, :, cz])
+        vmin, vmax = np.percentile(vol, 1), np.percentile(vol, 99)
+        ax.imshow(sl, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"{title}\nshape={vol.shape}", fontsize=9)
+        ax.axis("off")
+    fig.suptitle(f"fMRI preprocessing steps  |  t={T_IDX}", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(OUT_PATH, dpi=150, bbox_inches="tight")
+    print(f"Saved: {OUT_PATH}")
+    plt.show()
+
+    # --- Figure 2: original vs final, 3 planes ---
+    cx, cy, cz = np.array(step6.shape) // 2
+    cx0, cy0, cz0 = np.array(step1.shape) // 2
+
+    rows = [
+        ("Original .nii.gz (3mm MNI)", step1,
+         cx0, cy0, cz0,
+         np.percentile(step1, 1), np.percentile(step1, 99), "gray"),
+        ("Final: z-normalized (96³, 2mm)", step6,
+         cx, cy, cz,
+         -3, 3, "RdBu_r"),
+    ]
+
+    fig2, axes2 = plt.subplots(2, 3, figsize=(15, 10))
+    for row_idx, (title, vol, rx, ry, rz, vmin, vmax, cmap) in enumerate(rows):
+        plane_slices = [
+            (np.rot90(vol[:, :, rz]), f"Axial z={rz}"),
+            (np.rot90(vol[:, ry, :]), f"Coronal y={ry}"),
+            (np.rot90(vol[rx, :, :]), f"Sagittal x={rx}"),
+        ]
+        for col_idx, (sl, plane_title) in enumerate(plane_slices):
+            ax = axes2[row_idx, col_idx]
+            ax.imshow(sl, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+            if row_idx == 0:
+                ax.set_title(plane_title, fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(title, fontsize=9)
+            ax.axis("off")
+
+    fig2.suptitle("Original vs Final preprocessed  |  t=0", fontsize=12)
+    plt.tight_layout()
+    plt.savefig("fmri_compare.png", dpi=150, bbox_inches="tight")
+    print("Saved: fmri_compare.png")
+    plt.show()
+
+
+def test_fmri_zero_mask():
+    import nibabel as nib
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    BASE = (
+        "data/projects/EEG_FMRI/data_indi_preproc/"
+        "sub-01/ses-01/func/sub-01_ses-01_task-checker_bold/"
+    )
+    NII_PATH  = BASE + "func_preproc/func_pp_nofilt_sm0.mni152.3mm.nii.gz"
+    MASK_PATH = BASE + "func_seg/global_mask.nii.gz"
+    OUT_PATH  = "fmri_zero_mask.png"
+
+    vol  = np.asarray(nib.load(NII_PATH).dataobj,  dtype=np.float32)  # (X, Y, Z, T)
+    gmask = np.asarray(nib.load(MASK_PATH).dataobj, dtype=np.float32)  # (X, Y, Z)
+    print(f"Volume shape:      {vol.shape}")
+    print(f"Global mask shape: {gmask.shape}")
+
+    zero_mask = (vol == 0).all(axis=-1).astype(np.float32)  # 1 where always-zero
+    gmask_bin = (gmask > 0).astype(np.float32)              # 1 where brain
+
+    print(f"Zero voxels:        {int(zero_mask.sum())} / {zero_mask.size} ({100*zero_mask.mean():.1f}%)")
+    print(f"Global mask voxels: {int(gmask_bin.sum())} / {gmask_bin.size} ({100*gmask_bin.mean():.1f}%)")
+    print("Note: different spaces — no direct overlap computed")
+
+    rows = [
+        ("Zero-voxel mask  [MNI 3mm space]", zero_mask, "Reds"),
+        ("global_mask  [native func space]", gmask_bin, "Blues"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    for row_idx, (title, data, cmap) in enumerate(rows):
+        cx, cy, cz = np.array(data.shape) // 2
+        slices = [
+            (data[:, :, cz], f"Axial  z={cz}"),
+            (data[:, cy, :], f"Coronal  y={cy}"),
+            (data[cx, :, :], f"Sagittal  x={cx}"),
+        ]
+        for col_idx, (sl, subtitle) in enumerate(slices):
+            ax = axes[row_idx, col_idx]
+            ax.imshow(np.rot90(sl), cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+            if row_idx == 0:
+                ax.set_title(subtitle, fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(title, fontsize=9)
+            ax.axis("off")
+
+    fig.suptitle("Row 1: always-zero voxels  |  Row 2: global_mask.nii.gz\n"
+                 "(different spaces — not directly comparable)", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(OUT_PATH, dpi=150, bbox_inches="tight")
+    print(f"Saved: {OUT_PATH}")
+    plt.show()
+
+
+def test_eeg_preprocessing():
     """
-    Tests FMRIEncoderVolume end-to-end:
-      (B, 1, 96, 96, 96, 20) → backbone → GAP → projector → (B, 128)
-
-    Run from repo root:
-        python -m src.test
+    Compares raw .set vs preprocessed .npy EEG:
+      - PSD before/after bandpass shows band rejection
+      - per-channel mean/std after z-norm should be 0/1
+      - no NaN or Inf
     """
-    import torch
-    from src.fmri_encoder import FMRIEncoderVolume
+    import mne
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.signal import welch
+    from pathlib import Path
+    from train.config import TrainConfig
+    from src.utils.preprocess_data import preprocess_eeg
 
-    CKPT_PATH = "src/pt_neurostorm_mae_ratio0.5.ckpt"
-    B = 2
+    SET_PATH = Path(
+        "data/projects/EEG_FMRI/data_indi_preproc/"
+        "sub-01/ses-01/eeg/sub-01_ses-01_task-inscapes_eeg.set"
+    )
+    config = TrainConfig()
+    SR_proc = config.data.eeg_sr  # 200 Hz
 
-    print("Building FMRIEncoderVolume (frozen backbone)...")
-    encoder = FMRIEncoderVolume(ckpt_path=CKPT_PATH, proj_out_dim=128, freeze=True)
+    # load raw BEFORE preprocessing
+    raw = mne.io.read_raw_eeglab(str(SET_PATH), preload=True)
+    raw_sr = int(raw.info["sfreq"])
+    picks = mne.pick_types(raw.info, eeg=True)
+    raw_data = raw.get_data(picks=picks).astype(np.float32)  # (C, T) raw volts
+    print(f"Raw:  shape={raw_data.shape}  sr={raw_sr} Hz")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder.to(device)
-    print(f"Running on: {device}")
+    # run preprocessing → writes .npy
+    proc_data = preprocess_eeg(SET_PATH, config)              # (C, T) z-normed
+    print(f"Proc: shape={proc_data.shape}  sr={SR_proc} Hz")
 
-    x = torch.randn(B, 1, 96, 96, 96, 20, device=device)
-    print(f"Input  shape : {tuple(x.shape)}")
+    # sanity checks
+    assert not np.isnan(proc_data).any(), "NaN in preprocessed EEG!"
+    assert not np.isinf(proc_data).any(), "Inf in preprocessed EEG!"
 
-    encoder.eval()
-    with torch.no_grad():
-        z = encoder(x)
+    ch_means = proc_data.mean(axis=-1)
+    ch_stds  = proc_data.std(axis=-1)
+    print(f"Per-channel mean: min={ch_means.min():.4f}  max={ch_means.max():.4f}  (should be ~0)")
+    print(f"Per-channel std:  min={ch_stds.min():.4f}   max={ch_stds.max():.4f}  (should be ~1)")
 
-    print(f"Output shape : {tuple(z.shape)}")        # expect (2, 128)
-    print(f"Output norm  : {z.norm(dim=-1).tolist()}")  # expect [1.0, 1.0] (L2 normalized)
+    # PSD comparison
+    CH = 0
+    f_raw,  pxx_raw  = welch(raw_data[CH],  fs=raw_sr,  nperseg=raw_sr)
+    f_proc, pxx_proc = welch(proc_data[CH], fs=SR_proc, nperseg=SR_proc)
 
-    assert z.shape == (B, 128), f"Expected ({B}, 128), got {z.shape}"
-    assert torch.allclose(z.norm(dim=-1), torch.ones(B, device=device), atol=1e-5), \
-        "Output is not L2-normalized"
-    print("All assertions passed.")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax = axes[0]
+    ax.semilogy(f_raw,  pxx_raw,  lw=0.8, label="raw")
+    ax.axvline(config.data.lower_freq,  color="r", ls="--", label=f"low  {config.data.lower_freq} Hz")
+    ax.axvline(config.data.higher_freq, color="g", ls="--", label=f"high {config.data.higher_freq} Hz")
+    ax.set_xlim(0, min(raw_sr / 2, 150))
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Power (V²/Hz)")
+    ax.set_title(f"Raw PSD — ch {CH}  (sr={raw_sr} Hz)")
+    ax.legend()
+
+    ax = axes[1]
+    ax.semilogy(f_proc, pxx_proc, lw=0.8, color="orange", label="preprocessed")
+    ax.axvline(config.data.lower_freq,  color="r", ls="--")
+    ax.axvline(config.data.higher_freq, color="g", ls="--")
+    ax.set_xlim(0, SR_proc / 2)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_title(f"Preprocessed PSD — ch {CH}  (sr={SR_proc} Hz, z-normed)")
+    ax.legend()
+
+    fig.suptitle("EEG: PSD before vs after preprocessing", fontsize=12)
+    plt.tight_layout()
+    plt.savefig("eeg_psd_compare.png", dpi=150, bbox_inches="tight")
+    print("Saved: eeg_psd_compare.png")
+
+    # per-channel mean and std after z-norm
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
+    ch_idx = np.arange(len(ch_means))
+
+    axes2[0].bar(ch_idx, ch_means)
+    axes2[0].axhline(0, color="r", lw=1)
+    axes2[0].set_xlabel("Channel")
+    axes2[0].set_ylabel("Mean")
+    axes2[0].set_title("Per-channel mean (should be 0)")
+
+    axes2[1].bar(ch_idx, ch_stds, color="orange")
+    axes2[1].axhline(1, color="r", lw=1)
+    axes2[1].set_xlabel("Channel")
+    axes2[1].set_ylabel("Std")
+    axes2[1].set_title("Per-channel std (should be 1)")
+
+    fig2.suptitle("Z-norm check after preprocessing", fontsize=12)
+    plt.tight_layout()
+    plt.savefig("eeg_znorm_check.png", dpi=150, bbox_inches="tight")
+    print("Saved: eeg_znorm_check.png")
+    plt.show()
 
 
 if __name__ == '__main__':
-    test_fmri_encoder_volume()
+
+    # config = TrainConfig()
+
+    # dataset = SimultEEG_fMRI(config, subjects=["sub-01"])
+    # sampler = ContrastiveBatchSampler(dataset, config)
+
+    # loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn)
+
+    # for batch in loader:
+    #     print(batch.keys())
+    #     print(batch["eeg"].shape)
+    #     print(batch["fmri"].shape)
+
+    # print(len(sampler))
+    test_eeg_preprocessing()

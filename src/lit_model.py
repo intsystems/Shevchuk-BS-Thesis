@@ -15,7 +15,8 @@ class ContrastiveModel(L.LightningModule):
 
     def forward(self, x):
         
-    def on_after_batch_transfer(self, batch, dataloader_idx):
+    def on_after_batch_transfer(self, batch, batch_idx):
+        #applying augmentations
         
     def _calculate_loss(self, x):
 

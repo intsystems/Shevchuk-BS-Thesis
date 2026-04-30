@@ -1,6 +1,7 @@
 # Core deep learning
 torch>=2.0.0
 numpy>=1.24.0
+lightning
 
 # EEG processing
 mne>=1.6.0
@@ -8,10 +9,7 @@ mne>=1.6.0
 # fMRI processing
 nibabel>=5.0.0
 
-# BIOT model dependencies
-linear-attention-transformer>=0.19.0
-einops>=0.7.0
-scipy>=1.11.0
+nilearn
 
 # Training utilities
 tqdm>=4.66.0
@@ -19,6 +17,8 @@ requests>=2.31.0
 
 eeglabio
 
-lightning
-
 pandas
+
+braindecode
+
+transformers

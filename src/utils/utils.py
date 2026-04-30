@@ -12,105 +12,143 @@ def _variance_loss(z, eps=1e-4):
     std = torch.sqrt(z.var(dim=0) + eps)
     return F.relu(1.0 - std).mean()
 
-
-def multi_positive_clip_loss(z_f, z_e, tau=0.07, var_weight=0.25):
+def multi_positive_clip_loss(z_f: torch.Tensor, z_e: torch.Tensor, tau=0.07):
     """
-    z_f: [B, D], fMRI embeddings (pre-normalization)
-    z_e: [B, K, D], EEG embeddings (pre-normalization, K positives per fMRI)
-    var_weight: weight for variance regularization term (prevents collapse)
+    z_f: [T, K, D], fMRI embeddings
+    z_e: [T, K, D], EEG embeddings
     """
-    B, D = z_f.shape
-    _, K, _ = z_e.shape
+    T, K, D = z_f.shape
+    B = T * K
+    
+    # 1. Подготовка и нормализация
+    z_f = F.normalize(z_f.reshape(B, D), dim=-1)
+    z_e = F.normalize(z_e.reshape(B, D), dim=-1)
 
-    z_e_flat_raw = z_e.reshape(B * K, D)
-    var_loss = _variance_loss(z_f) + _variance_loss(z_e_flat_raw)
+    # 2. Матрица сходства (fMRI -> EEG)
+    # Строки - fMRI, Столбцы - EEG
+    logits = (z_f @ z_e.T) / tau
 
-    z_f = F.normalize(z_f, dim=-1)
+    # 3. Создание блочно-диагональной маски (позитивы по времени)
+    # Маска будет [B, B], где блоки KxK по диагонали - True
+    mask_pos = torch.kron(
+        torch.eye(T, device=logits.device), 
+        torch.ones((K, K), device=logits.device)
+    ).bool()
+
+    # 4. Вспомогательная функция для расчета лосса в одну сторону
+    def contrastive_step(l):
+        # l: матрица логитов [B, B]
+        # num: logsumexp только по позитивам в строке
+        l_pos = l.masked_fill(~mask_pos, float('-inf'))
+        num = torch.logsumexp(l_pos, dim=1)
+        
+        # den: logsumexp по всем элементам строки
+        den = torch.logsumexp(l, dim=1)
+        
+        return -(num - den).mean()
+
+    # 5. Симметричный лосс
+    loss_f2e = contrastive_step(logits)           # Ищем правильные ЭЭГ для фМРТ
+    loss_e2f = contrastive_step(logits.T)         # Ищем правильные фМРТ для ЭЭГ
+
+    return 0.5 * (loss_f2e + loss_e2f)
+
+
+def alignment_metric(z_f: torch.Tensor, z_e: torch.Tensor) -> torch.Tensor:
+    """
+    Mean cosine distance between EEG and fMRI embeddings for the same time point.
+
+    For each timestamp t, averages distances over all K subjects, then averages over T.
+    Distance = 1 - cosine_similarity, so 0 means perfect alignment, 2 means opposite.
+
+    z_f: [T, K, D] fMRI embeddings (raw, will be normalized inside)
+    z_e: [T, K, D] EEG embeddings
+
+    Returns scalar in [0, 2].
+    """
+    z_f = F.normalize(z_f, dim=-1)   # [T, K, D]
     z_e = F.normalize(z_e, dim=-1)
 
-    z_e_flat = z_e.reshape(B*K, D)
-    logits = (z_f @ z_e_flat.T) / tau
+    cos_sim = (z_f * z_e).sum(dim=-1)   # [T, K]  — per-pair cosine similarity
+    return (1.0 - cos_sim).mean()
 
-    mask_pos = torch.zeros((B, B*K), dtype=torch.bool, device=logits.device)
-    row = torch.arange(B, device=logits.device).unsqueeze(1)
-    cols = row * K + torch.arange(K, device=logits.device)
-    mask_pos[row, cols] = True
 
-    logits_pos = logits.masked_fill(~mask_pos, float('-inf'))
-    num = torch.logsumexp(logits_pos, dim=1)
+def effective_rank(z: torch.Tensor) -> torch.Tensor:
+    """
+    Effective rank of an embedding matrix via the entropy of its singular value spectrum.
+    Roy & Vetterli (2007): erank(Z) = exp(H),  H = -sum(p_i * log(p_i))
+    where p_i = sigma_i / sum(sigma_i).
 
-    den = torch.logsumexp(logits, dim=1)
+    Range: [1, D] — 1 means one dimension dominates, D means all dimensions used equally.
 
-    loss_f2e = -(num - den).mean()
+    z: [B, D]  batch of (optionally unnormalized) embeddings
+    """
+    with torch.no_grad():
+        sigma = torch.linalg.svdvals(z.float())   # [min(B,D)]
+        sigma = sigma[sigma > 0]
+        p = sigma / sigma.sum()
+        entropy = -(p * p.log()).sum()
+    return entropy.exp()
 
-    logits_e2f = (z_e_flat @ z_f.T) / tau
-    target = torch.arange(B, device=logits.device).repeat_interleave(K)
-    loss_e2f = F.cross_entropy(logits_e2f, target)
 
-    return 0.5 * (loss_f2e + loss_e2f) + var_weight * var_loss
+def recall_at_k(z_f: torch.Tensor, z_e: torch.Tensor, k: int) -> dict:
+    """
+    Recall@k: fraction of queries where at least one positive is in the top-k retrieved.
 
-class SymmetricMultimodalTripletLoss(nn.Module):
-    def __init__(self, margin=0.2):
-        """
-        Symmetric Batch-Hard Triplet Loss for Multimodal Contrastive Learning.
-        Applies Cross-Modal and Intra-Modal negative mining.
-        """
-        super().__init__()
-        self.margin = margin
+    For each fMRI query, positives are the K EEG samples at the same timestamp (and vice-versa).
+    Returns separate values for both directions.
 
-    def forward(self, eeg_emb, fmri_emb):
-        """
-        Args:
-            eeg_emb (torch.Tensor): [batch_size, embed_dim]
-            fmri_emb (torch.Tensor): [batch_size, embed_dim]
-        """
-        batch_size = eeg_emb.size(0)
-        
-        # 1. Normalize embeddings (L2 norm)
-        eeg_emb = F.normalize(eeg_emb, p=2, dim=1)
-        fmri_emb = F.normalize(fmri_emb, p=2, dim=1)
+    z_f, z_e: [T, K, D]
+    Returns: {"f2e": scalar, "e2f": scalar}
+    """
+    T, K, D = z_f.shape
+    B = T * K
 
-        # 2. Compute Distances (1 - Cosine Similarity)
-        # Positives (Diagonal of the cross-modal matrix)
-        pos_dist = 1.0 - (eeg_emb * fmri_emb).sum(dim=1) 
+    z_f = F.normalize(z_f.reshape(B, D), dim=-1)
+    z_e = F.normalize(z_e.reshape(B, D), dim=-1)
 
-        # Distance Matrices for Negative Mining
-        dist_cross      = 1.0 - torch.matmul(eeg_emb, fmri_emb.t()) # [B, B]
-        dist_intra_eeg  = 1.0 - torch.matmul(eeg_emb, eeg_emb.t())  # [B, B]
-        dist_intra_fmri = 1.0 - torch.matmul(fmri_emb, fmri_emb.t())# [B, B]
+    # Block-diagonal mask: True where query and key share a timestamp
+    mask_pos = torch.kron(
+        torch.eye(T, device=z_f.device),
+        torch.ones(K, K, device=z_f.device),
+    ).bool()                                                        # [B, B]
 
-        # 3. Create Identity Mask to ignore diagonals (positives / self-matches)
-        mask = torch.eye(batch_size, dtype=torch.bool, device=eeg_emb.device)
+    def _recall(queries, keys):
+        sim = queries @ keys.T                                      # [B, B]
+        rank = sim.argsort(dim=1, descending=True).argsort(dim=1) + 1  # [B, B]
+        hit = ((rank <= k) & mask_pos).any(dim=1).float()
+        return hit.mean().item()
 
-        # Apply mask (fill diagonal with infinity so they are never picked as minimums)
-        neg_cross_masked = dist_cross.masked_fill(mask, float('inf'))
-        neg_intra_eeg_masked = dist_intra_eeg.masked_fill(mask, float('inf'))
-        neg_intra_fmri_masked = dist_intra_fmri.masked_fill(mask, float('inf'))
+    return {"f2e": _recall(z_f, z_e), "e2f": _recall(z_e, z_f)}
 
-        # 4. Mine the Hardest Negatives (Minimum distance)
-        # Cross-Modal
-        hard_neg_fmri_for_eeg = neg_cross_masked.min(dim=1)[0] # Row min
-        hard_neg_eeg_for_fmri = neg_cross_masked.min(dim=0)[0] # Col min
-        
-        # Intra-Modal
-        hard_neg_eeg_for_eeg = neg_intra_eeg_masked.min(dim=1)[0]
-        hard_neg_fmri_for_fmri = neg_intra_fmri_masked.min(dim=1)[0]
 
-        def soft_triplet(pos, neg):
-            # Softplus(x) = ln(1 + exp(x))
-            return F.softplus(pos - neg + self.margin)
+def mean_reciprocal_rank(z_f: torch.Tensor, z_e: torch.Tensor) -> dict:
+    """
+    MRR: for each query, takes the reciprocal rank of the first (highest-ranked) positive,
+    then averages over all queries.
 
-        loss_cross_eeg  = soft_triplet(pos_dist, hard_neg_fmri_for_eeg)
-        loss_cross_fmri = soft_triplet(pos_dist, hard_neg_eeg_for_fmri)
-        loss_intra_eeg  = soft_triplet(pos_dist, hard_neg_eeg_for_eeg)
-        loss_intra_fmri = soft_triplet(pos_dist, hard_neg_fmri_for_fmri)
+    MRR = 1 means every query's top-1 result is a positive.
+    MRR → 0 means positives are buried at the bottom of the ranking.
 
-        # 6. Average the losses
-        total_loss = (
-            loss_cross_eeg.mean() + 
-            loss_cross_fmri.mean() + 
-            loss_intra_eeg.mean() + 
-            loss_intra_fmri.mean()
-        ) / 4.0
-        print(f"DEBUG: pos={pos_dist.mean().item():.4f}, neg={hard_neg_fmri_for_eeg.mean().item():.4f}")
-        return total_loss
+    z_f, z_e: [T, K, D]
+    Returns: {"f2e": scalar, "e2f": scalar}
+    """
+    T, K, D = z_f.shape
+    B = T * K
+
+    z_f = F.normalize(z_f.reshape(B, D), dim=-1)
+    z_e = F.normalize(z_e.reshape(B, D), dim=-1)
+
+    mask_pos = torch.kron(
+        torch.eye(T, device=z_f.device),
+        torch.ones(K, K, device=z_f.device),
+    ).bool()                                                            # [B, B]
+
+    def _mrr(queries, keys):
+        sim = queries @ keys.T                                          # [B, B]
+        rank = sim.argsort(dim=1, descending=True).argsort(dim=1) + 1  # [B, B]
+        # For each query, take the rank of its highest-ranked positive
+        first_pos_rank = rank.masked_fill(~mask_pos, B + 1).min(dim=1).values
+        return (1.0 / first_pos_rank.float()).mean().item()
+
+    return {"f2e": _mrr(z_f, z_e), "e2f": _mrr(z_e, z_f)}

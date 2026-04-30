@@ -1,17 +1,13 @@
 import os
 import sys
-import torch.nn as nn
 import torch
+import torch.nn as nn
 import random
 
 from src.utils.shared_layers import Projector
 from train.config import TrainConfig
 
 import torch.nn.functional as F
-
-# NeuroSTORM encoder output channels: embed_dim * c_multiplier^(n_stages-1) = 36 * 2^3
-NEUROSTORM_OUT_DIM = 288
-
 
 def _load_neurostorm_backbone(ckpt_path: str, freeze: bool = True) -> nn.Module:
     """
@@ -66,7 +62,7 @@ class FmriAugmentor:
     def __call__(self, x):
         #x = self._amplitude_scale(x)
         x = self._masking(x)
-        x = self.hrf_jitter_tensor(x)
+        #x = self.hrf_jitter_tensor(x)
         return x
 
     def _smoothening(self, x):
@@ -145,6 +141,23 @@ class FmriAugmentor:
         mask = self._smoothening(mask.unsqueeze(-1))
 
         return x * mask
+    
+class FMRIProjectionHead(nn.Module):
+    def __init__(self, config: TrainConfig):
+        super().__init__()
+
+        self.mlp = Projector(config)
+
+    def forward(self, x):
+        """
+        Input: (B, 288, 2, 2, 2, T)
+        """
+        # 1. Spatiotemporal Pooling: усредняем по X, Y, Z и T (индексы 2, 3, 4, 5)
+        x_pooled = x.mean(dim=(2, 3, 4, 5)) # Ожидаемый выход: (B, 288)
+        
+        # 2. Проекция в общее пространство
+        return self.mlp(x_pooled)
+
 class FMRIEncoderVolume(nn.Module):
     """
     Volumetric fMRI encoder: NeuroSTORM backbone → Global Average Pool → Projector.
@@ -161,10 +174,10 @@ class FMRIEncoderVolume(nn.Module):
         freeze:       if True, backbone weights are frozen (fine-tune projector only)
     """
 
-    def __init__(self, ckpt_path: str, proj_out_dim: int = 128, freeze: bool = True):
+    def __init__(self, config: TrainConfig):
         super().__init__()
-        self.backbone = _load_neurostorm_backbone(ckpt_path, freeze=freeze)
-        self.projector = Projector(NEUROSTORM_OUT_DIM, proj_out_dim)
+        self.backbone = _load_neurostorm_backbone(config.model.Neurostorm_ckpt, freeze=freeze)
+        self.projector = FMRIProjectionHead(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

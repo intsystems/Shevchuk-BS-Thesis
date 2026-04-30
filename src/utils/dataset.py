@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset, Sampler
 import numpy as np
+import torch
 from pathlib import Path
 import nibabel as nib
 import pandas as pd
@@ -8,9 +9,10 @@ from collections import defaultdict
 import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+import random
 
 from train.config import TrainConfig
-from src.utils.preprocess_data import save_as_npy, downsample_eeg, bandpass_filter, transform_to_neurostorm_space
+from src.utils.preprocess_data import save_as_npy, downsample_eeg, bandpass_filter
 
 def _convert_tsv(tsv_path):
     arr = pd.read_csv(tsv_path, sep="\t", header=None).to_numpy(dtype=np.float32)
@@ -35,7 +37,8 @@ def _convert_nii(args):
 class SimultEEG_fMRI(Dataset):
     def __init__(
         self,
-        config: TrainConfig,  
+        config: TrainConfig,
+        subjects: list = None,  # e.g. ["sub-01", "sub-02"]; None = all subjects
     ):
         """
         Arguments:
@@ -53,12 +56,14 @@ class SimultEEG_fMRI(Dataset):
         self.dirname = self.config.data_dir
         self.root = Path(self.dirname).resolve()
 
+        self.subjects = set(subjects) if subjects is not None else None
+
         self.pairs = []   #list of dicts with eeg_path, fmri_path, n_tr, etc.
         self.index = []   #list of (pair_id, tr_idx)
 
         self.meta = []
 
-        self._preprocess()
+        #self._preprocess()
         self._build_pairs_and_index()
     
     @classmethod
@@ -100,12 +105,14 @@ class SimultEEG_fMRI(Dataset):
 
             parts = corresp_name.split("_")
 
-            run = 1
+            run = parts[2]
             if "run" in parts[3]:
-                run = parts[3][-1:]
+                run += "_" + parts[3]
 
             sub = next(p for p in parts if p.startswith("sub-"))
-            ses = next(p for p in parts if p.startswith("ses-"))
+
+            if self.subjects is not None and sub not in self.subjects:
+                continue
 
             pair_id = len(self.pairs)
             
@@ -119,7 +126,6 @@ class SimultEEG_fMRI(Dataset):
                 "n_tr": max_tr - min_tr + 1,
                 "run": run,
                 "sub": sub,
-                "ses": ses,
                 "activity": parts[2],
             })
 
@@ -129,63 +135,32 @@ class SimultEEG_fMRI(Dataset):
                 self.index.append((pair_id, tr_idx))
                 self.meta.append({
                     "sub": sub,
-                    "run": pair_id,  # unique per recording file, so temporal distance is only enforced within the same fMRI/EEG pair
+                    "run": run,  # unique per recording file, so temporal distance is only enforced within the same fMRI/EEG pair
                     "tr": tr_idx,
                 })
 
         if len(self.index) == 0:
             raise RuntimeError("No fMRI/EEG pairs was found")
-
-    def _preprocess(self):
-        """
-            Detects EEG data, applies filterband, transforms data to .npy, and Z-normalizes
-            Detects fMRI data, transforms it to .npy, and Z-normalizes
-            Then forms slices of the data based on TR of fMRI
-        """
-
-        DATA_ROOT = Path(self.dirname).resolve()
-        func_dirs = DATA_ROOT.glob("sub-*/ses-*/func")
-
-        # --- 1. fMRI PREPROCESSING & NORMALIZATION ---
-        if self.config.use_parcellation == True:
-            tsv_files = [
-                p for p in DATA_ROOT.rglob(f"*{self.config.parcellation_suffix}*.tsv")
-                if not p.with_suffix(".npy").exists()
-            ]
-            with ProcessPoolExecutor() as executor:
-                futures = {executor.submit(_convert_tsv, p): p for p in tsv_files}
-                for future in tqdm(as_completed(futures), total=len(tsv_files), desc="tsv->npy"):
-                    future.result()
-        else:
-            scaling_factor = self.config.orig_fmri_res / self.config.target_fmri_res
-
-            nii_files = [
-                f for func_dir in func_dirs
-                for f in func_dir.rglob(f"{self.config.no_parcellation_prefix}*.nii.gz")
-                if not f.with_suffix("").with_suffix(".npy").exists()
-            ]
-            for f in tqdm(nii_files, desc="nii.gz->npy"):
-                _convert_nii((f, scaling_factor))
-
-        # --- 2. EEG PREPROCESSING & NORMALIZATION ---
-        eeg_dirs = DATA_ROOT.glob("sub-*/ses-*/eeg")
-        for eeg_root in eeg_dirs:
-            pattern = f"*.set"
-            for file_path in eeg_root.rglob(pattern):
-                if "checkeroff" in file_path.name or "checkerout" in file_path.name or "checker_recording" in file_path.name:
-                    continue
-                
-                bandpass_filter(file_path, self.config.lower_freq, self.config.higher_freq)
-                downsample_eeg(file_path, self.config.target_eeg_freq)
-                save_as_npy(file_path)
+    def _get_mmap(self, path):
+        """Return a cached mmap for path, opening it once per worker."""
+        path = str(path)
+        if not hasattr(self, "_mmap_cache"):
+            self._mmap_cache = {}
+        if path not in self._mmap_cache:
+            self._mmap_cache[path] = np.load(path, mmap_mode="r")
+        return self._mmap_cache[path]
 
     def __getitem__(self, idx):
         pair_id, tr_idx = self.index[idx]
+        meta = self.meta[idx]
         info = self.pairs[pair_id]
 
-        fmri = np.load(info["fmri_path"], mmap_mode="r")  #[n_roi, t] or [x,y,z,t]
-        eeg = np.load(info["eeg_path"], mmap_mode="r")    #[n_ch, t]
+        fmri = self._get_mmap(info["fmri_path"])  #[n_roi, t] or [x,y,z,t]
+        eeg  = self._get_mmap(info["eeg_path"])   #[n_ch, t]
         
+        tr_idx = min(max(tr_idx + random.choice(self.config.fmri_aug.tr_jitter), 0), fmri.shape[-1] - 1)
+        print(tr_idx)
+
         t_fmri = tr_idx * self.config.tr
 
         #getting previous eeg window(accounting hrf_shift) prior to fmri window
@@ -195,10 +170,6 @@ class SimultEEG_fMRI(Dataset):
 
         fmri_start = tr_idx
         fmri_end = int(tr_idx + np.ceil(self.config.eeg_win_sec / self.config.tr))
-
-        print(fmri_start)
-        print(fmri_end)
-        print(type(fmri_end))
 
         if self.config.use_parcellation:
             fmri_tr = np.array(fmri[:, fmri_start:fmri_end], dtype=np.float32)
@@ -227,100 +198,102 @@ class SimultEEG_fMRI(Dataset):
             eeg_windows.append(eeg_win)
             
         sample = {
-            "eeg": eeg_windows,               #[K, C, T]
-            "fmri": fmri_tr,              #[R, T] or [X,Y,Z,T]
+            "eeg":torch.Tensor(eeg_windows),               #[K, C, T]
+            "fmri": torch.Tensor(fmri_tr),              #[R, T] or [X,Y,Z,T]
             "tr_idx": int(tr_idx),
-            "sub": info["sub"],
-            "ses": info["ses"],
+            "sub": meta["sub"],
+            "run": meta["run"],
             "t_fmri": float(t_fmri),
-            "ts_eeg": ts_eeg,
+            "ts_eeg": ts_eeg[0],
         }
         return sample
 
-#custom batch sampler to support correct batch formation for contrastive learning
+def collate_fn(batch):
+    keys_to_remove = ["tr_idx", "sub", "run", "t_fmri", "ts_eeg"]
+    batch = sorted(batch, key=lambda x: (x["tr_idx"], x["sub"]))
+    batch = [{k: v for k, v in elem.items() if k not in keys_to_remove} for elem in batch]
+
+    return {
+        key: torch.stack([d[key] for d in batch])
+        for key in batch[0]
+    }
+
 class ContrastiveBatchSampler(Sampler):
-    def __init__(
-        self,
-        dataset,
-        batch_size=128,
-        subs_per_batch=8,
-        min_temp_dist=5,
-        drop_last=True,
-        max_batches=None,
-    ):
+    def __init__(self, dataset: SimultEEG_fMRI, config: TrainConfig):
+        """
+        num_timestamps (M): Сколько разных моментов времени в одном батче.
+        num_subjects (K): Сколько субъектов брать для каждого момента времени.
+        margin_tr: Минимальное расстояние между таймкодами (15 TR = 31.5 сек).
+        Размер итогового батча = M * K.
+        """
         self.dataset = dataset
-        self.batch_size = batch_size
-        self.subs_per_batch = subs_per_batch
-        self.min_temp_dist = min_temp_dist
-        self.drop_last = drop_last
-        self.max_batches = max_batches
-
-        assert batch_size % subs_per_batch == 0
-        self.M = batch_size // subs_per_batch
-
-        #idx grouping by subject
-        self.by_sub = defaultdict(list)
-        for idx, meta in enumerate(dataset.meta):
-            self.by_sub[meta["sub"]].append(idx)
-
-        self.subs = list(self.by_sub.keys())
-
+        self.M = config.data.num_timestamps
+        self.K = config.data.num_subjects
+        self.margin = config.data.margin_tr
+        
+        # Индексация датасета: run (видео) -> tr (таймкод) -> список глобальных индексов
+        self.run_tr_indices = defaultdict(lambda: defaultdict(list))
+        for idx, meta in enumerate(self.dataset.meta):
+            # 'run' должен уникально идентифицировать конкретное видео (например, 'task-movie1_run-01')
+            self.run_tr_indices[meta['run']][meta['tr']].append(idx)
+            
     def __iter__(self):
-        if len(self.subs) < self.subs_per_batch:
-            return
-
-        n_yielded = 0
-        max_attempts = 1000
-
-        for _ in range(max_attempts):
-            if self.max_batches is not None and n_yielded >= self.max_batches:
-                break
-
-            chosen_subs = random.sample(self.subs, self.subs_per_batch)
-            batch = []
-            success = True
-
-            for sub in chosen_subs:
-                indices = self.by_sub[sub][:]
-                random.shuffle(indices)
-
-                picked = []
-                picked_meta = []
-
-                for idx in indices:
-                    meta = self.dataset.meta[idx]
-
-                    ok = True
-                    for m in picked_meta:
-                        if (
-                            meta["run"] == m["run"]
-                            and abs(meta["tr"] - m["tr"]) < self.min_temp_dist
-                        ):
-                            ok = False
-                            break
-
-                    if ok:
-                        picked.append(idx)
-                        picked_meta.append(meta)
-
-                    if len(picked) == self.M:
+        # Перемешиваем порядок видео, чтобы не учить одно видео подряд
+        runs = list(self.run_tr_indices.keys())
+        random.shuffle(runs)
+        
+        for run in runs:
+            # Получаем все доступные таймкоды для этого видео
+            available_trs = list(self.run_tr_indices[run].keys())
+            random.shuffle(available_trs)
+            
+            # Пока есть доступные таймкоды, пытаемся собрать батч
+            while available_trs:
+                selected_trs = []
+                
+                # Жадный поиск M таймкодов с учетом margin
+                for tr in available_trs:
+                    # Проверяем, что текущий TR отстоит от всех уже выбранных минимум на margin
+                    if all(abs(tr - sel_tr) >= self.margin for sel_tr in selected_trs):
+                        selected_trs.append(tr)
+                        
+                    if len(selected_trs) == self.M:
                         break
-
-                if len(picked) < self.M:
-                    success = False
+                        
+                # Если не смогли набрать M независимых таймкодов (конец видео), 
+                # прерываем цикл для этого видео. Жесткий размер батча важен для стабильности лосса.
+                if len(selected_trs) < self.M:
                     break
-
-                batch.extend(picked)
-
-            if success and len(batch) == self.batch_size:
-                yield batch
-                n_yielded += 1
-            elif not self.drop_last and len(batch) > 0:
-                yield batch
-                n_yielded += 1
+                    
+                # Удаляем выбранные таймкоды из пула текущей эпохи
+                for tr in selected_trs:
+                    available_trs.remove(tr)
+                    
+                # Формируем итоговые индексы для батча
+                batch_indices = []
+                for tr in selected_trs:
+                    subjs = self.run_tr_indices[run][tr]
+                    
+                    # Если субъектов больше K, берем случайные K
+                    if len(subjs) >= self.K:
+                        sampled_subjs = random.sample(subjs, self.K)
+                    # Если меньше, берем сколько есть (или можно использовать замену)
+                    else:
+                        sampled_subjs = subjs 
+                        
+                    batch_indices.extend(sampled_subjs)
+                    
+                yield batch_indices
 
     def __len__(self):
-        if self.drop_last:
-            return len(self.dataset) // self.batch_size
-        else:
-            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+        # Приблизительная оценка количества батчей для прогресс-бара Lightning
+        # (Кол-во уникальных TR / margin) * кол-во видео // M
+        total_batches = 0
+        for run, tr_dict in self.run_tr_indices.items():
+            max_tr = max(tr_dict.keys())
+            min_tr = min(tr_dict.keys())
+            # Оценка: сколько независимых таймкодов помещается в видео
+            independent_trs = (max_tr - min_tr) // self.margin
+            print(independent_trs)
+            total_batches += independent_trs // self.M
+        return total_batches
