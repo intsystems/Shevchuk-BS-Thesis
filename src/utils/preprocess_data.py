@@ -142,45 +142,38 @@ def preprocess_eeg(set_path: Path, config: TrainConfig) -> np.ndarray:
     std  = data.std(axis=-1, keepdims=True)
     data = (data - mean) / (std + 1e-8)
 
-    print(np.mean(data, axis=-1))
-
     np.save(npy_path, data)                     # overwrite with z-normed version
     return data
 
 def preprocess_dataset(config: TrainConfig):
-    for i in range(config.data.start_sub, config.data.end_sub + 1):
-        download_natview_subjects(start_sub=i, end_sub=i)
+    dataset_path = Path(config.data.data_dir)
 
-        dataset_path = Path(config.data.data_dir)
+    with h5py.File(config.data.output_h5, 'a') as h5f:
+        for i in range(config.data.start_sub, config.data.end_sub + 1):
+            sub_id = f"sub-{i:02d}"
+            download_natview_subjects(start_sub=i, end_sub=i)
 
-        if config.data.use_parcellation:
-            fmri_files = dataset_path.rglob("*" + config.data.parcellation_suffix + ".nii.gz")
-        else:
-            fmri_files = dataset_path.rglob(config.data.no_parcellation_prefix + "*.nii.gz")
+            if config.data.use_parcellation:
+                fmri_files = list((dataset_path / sub_id).rglob("*" + config.data.parcellation_suffix + ".nii.gz"))
+            else:
+                fmri_files = list((dataset_path / sub_id).rglob(config.data.no_parcellation_prefix + "*.nii.gz"))
 
-        with h5py.File(config.data.output_h5, 'w') as h5f:
-            for f_path in tqdm(fmri_files, desc="Конвертация в H5"):
-                if any(excluded_activity in f_path.parents[1].name for excluded_activity in config.data.excluded_activities):
+            for f_path in tqdm(fmri_files, desc=f"{sub_id}"):
+                if any(excl in f_path.parents[1].name for excl in config.data.excluded_activities):
                     continue
 
                 f_path_p = f_path.relative_to(config.data.data_dir).parts
+                activity_parts = f_path_p[3].split("_")
+                task_part = activity_parts[2:3]
+                run_part  = activity_parts[3:4]
+                activity = "_".join(task_part + run_part) if run_part and "run" in run_part[0] else (task_part[0] if task_part else "unknown")
 
-                sub_id = f_path_p[0]
-                activity = f_path_p[3].split("_")
-
-                task_part = activity[2:3] # Всегда список: ['task-name'] или []
-                run_part = activity[3:4]  # Всегда список: ['run-01'] или []
-
-                if run_part and "run" in run_part[0]:
-                    activity = "_".join(task_part + run_part)
-                else:
-                    activity = task_part[0] if task_part else "unknown_task"
-
-                print(activity)
-                print(sub_id)     
+                grp = f"{sub_id}/{activity}"
+                if f"{grp}/fmri" in h5f and f"{grp}/eeg" in h5f:
+                    print(f"[SKIP] {grp}")
+                    continue
 
                 try:
-                    # fMRI: resample + crop + z-norm → (T, 96, 96, 96)
                     fmri_data = preprocess_fmri(f_path, config)
                     fmri_data = fmri_data.to(torch.float16).permute(3, 0, 1, 2)
 
@@ -188,24 +181,24 @@ def preprocess_dataset(config: TrainConfig):
                     eeg_npy = f_path.parents[3] / "eeg" / f"{task_name}_eeg.npy"
                     eeg_set = eeg_npy.with_suffix(".set")
                     preprocess_eeg(eeg_set, config)
-                    eeg_data = torch.Tensor(np.load(eeg_npy).astype(np.float16).T)  # (T_eeg, C)
+                    eeg_data = np.load(eeg_npy).astype(np.float16).T  # (T_eeg, C)
 
-                    grp = f"{sub_id}/{activity}"
                     if f"{grp}/fmri" not in h5f:
                         fmri_win_trs = int(np.ceil(config.data.eeg_win_sec / config.data.tr))
                         h5f.create_dataset(f"{grp}/fmri", data=fmri_data,
-                                        chunks=(fmri_win_trs, 96, 96, 96),
-                                        compression="gzip", compression_opts=4)
+                                           chunks=(fmri_win_trs, 96, 96, 96),
+                                           compression="gzip", compression_opts=4)
                     if f"{grp}/eeg" not in h5f:
                         eeg_win_samples = int(config.data.eeg_win_sec * config.data.eeg_sr)
                         h5f.create_dataset(f"{grp}/eeg", data=eeg_data,
-                                        chunks=(eeg_win_samples, eeg_data.shape[1]),
-                                        compression="gzip", compression_opts=4)
+                                           chunks=(eeg_win_samples, eeg_data.shape[1]),
+                                           compression="gzip", compression_opts=4)
 
+                    print(f"[OK] {grp}")
                 except Exception as e:
-                    print(f"Ошибка в файле {f_path}: {e}")
-        
-        shutil.rmtree(dataset_path)
+                    print(f"[ERR] {grp}: {e}")
+
+            shutil.rmtree(dataset_path / sub_id)
 
 
 def download_natview_subjects(
