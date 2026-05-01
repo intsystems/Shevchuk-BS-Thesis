@@ -184,10 +184,6 @@ def preprocess_dataset(config: TrainConfig):
                     eeg_npy = f_path.parents[3] / "eeg" / f"{task_name}_eeg.npy"
                     eeg_set = eeg_npy.with_suffix(".set")
 
-                    if not first_eeg_done:
-                        _eeg_qc_plot(eeg_set, config, sub_id, activity)
-                        first_eeg_done = True
-
                     preprocess_eeg(eeg_set, config)
                     eeg_data = np.load(eeg_npy).astype(np.float16).T  # (T_eeg, C)
 
