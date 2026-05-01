@@ -171,7 +171,7 @@ def preprocess_dataset(config: TrainConfig):
                 run_part  = activity_parts[3:4]
                 activity = "_".join(task_part + run_part) if run_part and "run" in run_part[0] else (task_part[0] if task_part else "unknown")
 
-                grp = f"{sub_id}/{ses_id}/{activity}"
+                grp = f"{sub_id}/{ses_id[0]}/{activity}"
                 if f"{grp}/fmri" in h5f and f"{grp}/eeg" in h5f:
                     print(f"[SKIP] {grp}")
                     continue
