@@ -16,6 +16,9 @@ def multi_positive_clip_loss(z_f: torch.Tensor, z_e: torch.Tensor, tau=0.07):
     """
     z_f: [T, K, D], fMRI embeddings
     z_e: [T, K, D], EEG embeddings
+
+    T - number of unique moments for some recording,
+    K - number of subject that correspond to this moment
     """
     T, K, D = z_f.shape
     B = T * K
