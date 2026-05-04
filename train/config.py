@@ -72,12 +72,17 @@ class ModelConfig:
     projector_hidden_dim: int = 256
     projector_out_dim: int = 128
 
+    lora_rank: int = 4
+    lora_alpha: float = 4
+    lora_dropout: float = 0.05
+
 @dataclass
 class TrainingConfig:
     checkpoint_dir: str = "checkpoints/"
     #training params
     batch_size: int = 64
-    learning_rate: float = 1e-4
+    backbone_lr: float = 1e-4
+    proj_lr: float = 1e-5
     weight_decay: float = 5e-2
     num_epochs:int = 100
     tau: float = 0.1 #for infonce loss
