@@ -87,6 +87,8 @@ class TrainingConfig:
     num_epochs:int = 100
     tau: float = 0.1 #for infonce loss
 
+    freeze_backbone = True
+
     train_ratio = 0.8
     val_ratio = 0.1
     test_ratio = 0.1

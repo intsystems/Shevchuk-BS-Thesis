@@ -18,7 +18,7 @@ class ContrastiveModel(L.LightningModule):
         lora_config = LoraConfig(
             r=config.model.lora_rank,
             lora_alpha=config.model.lora_alpha,
-            target_modules=["query", "value"], 
+            target_modules=["qkv"],
             exclude_modules=["projector"],
             lora_dropout=config.model.lora_dropout,
             bias="none"

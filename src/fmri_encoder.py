@@ -176,7 +176,7 @@ class FMRIEncoderVolume(nn.Module):
 
     def __init__(self, config: TrainConfig):
         super().__init__()
-        self.backbone = _load_neurostorm_backbone(config.model.Neurostorm_ckpt, freeze=freeze)
+        self.backbone = _load_neurostorm_backbone(config.model.Neurostorm_ckpt, freeze=config.train.freeze_backbone)
         self.projector = FMRIProjectionHead(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
