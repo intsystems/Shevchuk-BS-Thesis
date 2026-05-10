@@ -15,19 +15,27 @@ class ContrastiveModel(L.LightningModule):
         self.eeg_encoder = eeg_encoder
         self.fmri_encoder = fmri_encoder
 
-        lora_config = LoraConfig(
+        eeg_lora = LoraConfig(
             r=config.model.lora_rank,
             lora_alpha=config.model.lora_alpha,
             target_modules=["qkv"],
             exclude_modules=["projector"],
             lora_dropout=config.model.lora_dropout,
-            bias="none"
+            bias="none",
+        )
+        fmri_lora = LoraConfig(
+            r=config.model.lora_rank,
+            lora_alpha=config.model.lora_alpha,
+            target_modules=["in_proj", "out_proj", "x_proj", "dt_proj"],
+            exclude_modules=["projector"],
+            lora_dropout=config.model.lora_dropout,
+            bias="none",
         )
 
         self.config = config
 
-        self.eeg_encoder = get_peft_model(self.eeg_encoder, lora_config)
-        self.fmri_encoder = get_peft_model(self.fmri_encoder, lora_config)
+        self.eeg_encoder  = get_peft_model(self.eeg_encoder, eeg_lora)
+        self.fmri_encoder = get_peft_model(self.fmri_encoder, fmri_lora)
 
         self.eeg_augmentor = EEGAugmentor(config)
         self.fmri_augmentor = EEGAugmentor(config)

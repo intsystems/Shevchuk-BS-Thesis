@@ -175,14 +175,13 @@ def _process_subject(sub_id, fmri_files, tmp_path, config):
                 preprocess_eeg(eeg_set, config)
                 eeg_data = np.load(eeg_npy).astype(np.float16).T  # (T_eeg, C)
 
-                fmri_win_trs  = int(np.ceil(config.data.eeg_win_sec / config.data.tr))
-                eeg_win_samples = int(config.data.eeg_win_sec * config.data.eeg_sr)
                 tmp.create_dataset(f"{grp}/fmri", data=fmri_data,
-                                   chunks=(fmri_win_trs, 96, 96, 96),
-                                   compression="gzip", compression_opts=4)
+                                   chunks=(1, 96, 96, 96),
+                                   compression="lzf")
                 tmp.create_dataset(f"{grp}/eeg", data=eeg_data,
-                                   chunks=(eeg_win_samples, eeg_data.shape[1]),
-                                   compression="gzip", compression_opts=4)
+                                   chunks=(int(config.data.tr * config.data.eeg_sr),
+                                    eeg_data.shape[1]),
+                                   compression="lzf")
                 tmp.flush()
                 wrote_any = True
                 print(f"[OK] {grp}")

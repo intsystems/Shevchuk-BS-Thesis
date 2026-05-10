@@ -72,10 +72,6 @@ class ModelConfig:
     projector_hidden_dim: int = 256
     projector_out_dim: int = 128
 
-    lora_rank: int = 4
-    lora_alpha: float = 4
-    lora_dropout: float = 0.05
-
 @dataclass
 class TrainingConfig:
     checkpoint_dir: str = "checkpoints/"
@@ -87,15 +83,15 @@ class TrainingConfig:
     num_epochs:int = 100
     tau: float = 0.1 #for infonce loss
 
-    freeze_backbone = True
+    freeze_backbone: bool = True
 
-    train_ratio = 0.8
-    val_ratio = 0.1
-    test_ratio = 0.1
+    train_ratio: float = 0.8
+    val_ratio: float = 0.1
+    test_ratio: float = 0.1
     
-    seed = 42
-    num_workers = 0
-    save_every = 5
+    seed: int = 42
+    num_workers: int = 0
+    save_every:int = 5
 
 @dataclass
 class TrainConfig:
