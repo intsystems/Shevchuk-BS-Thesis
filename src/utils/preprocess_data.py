@@ -177,12 +177,11 @@ def _process_subject(sub_id, fmri_files, tmp_path, config):
 
                 tmp.create_dataset(f"{grp}/fmri", data=fmri_data,
                                    chunks=(1, 96, 96, 96),
-                                   compression="lzf")
+                                   compression="lzf", shuffle=True)
                 tmp.create_dataset(f"{grp}/eeg", data=eeg_data,
                                    chunks=(int(config.data.tr * config.data.eeg_sr),
                                     eeg_data.shape[1]),
-                                   compression="lzf")
-                tmp.flush()
+                                   compression="lzf", shuffle=True)
                 wrote_any = True
                 print(f"[OK] {grp}")
             except Exception as e:
