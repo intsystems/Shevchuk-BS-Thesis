@@ -55,54 +55,47 @@ class EEGAugmentor:
         pink_noise = torch.fft.irfft(pink_noise_fft, n=length)
         
         # 5. Scale to desired intensity
-        # We normalize to unit variance first, then scale by self.sigma
-        pink_noise = (pink_noise / pink_noise.std()) * self.sigma
+        # We normalize to unit variance first, then scale by self.config.sigma
+        pink_noise = (pink_noise / pink_noise.std()) * self.config.sigma
         
         return x + pink_noise
     
     def _channel_drop(self, x):
-        mask = torch.bernoulli(torch.ones(x.shape[0], x.shape[1], 1) * self.config.channel_drop_prob)
-
+        mask = torch.bernoulli(
+            torch.ones(x.shape[0], x.shape[1], 1, device=x.device) * self.config.channel_drop_prob
+        )
         return x * mask
 
     def _time_shift(self, x):
-        shifts = torch.randint(-self.max_time_shift, self.max_time_shift, (x.shape[0],))
-        print(shifts)
+        shifts = torch.randint(-self.config.max_time_shift, self.config.max_time_shift,
+                               (x.shape[0],), device=x.device)
+        return torch.stack([torch.roll(x[i].squeeze(), shifts[i].item(), dims=(-1)) for i in range(x.shape[0])])
 
-        return torch.stack([torch.roll(x[i].squeeze(), shifts[i], dims=(-1)) for i in range(x.shape[0])])
-    
     def _freq_masking(self, x):
-        fft = torch.fft.rfft(x, dim=-1) #applying fft along time axis
-
-        print(fft.shape)
-
+        fft = torch.fft.rfft(x, dim=-1)
         num_freqs = fft.shape[-1]
 
-        #generate freq to mask out
-        
-        apply_mask = (torch.rand((x.shape[0], x.shape[1])) > self.config.bandwidth_mask_prob).unsqueeze(-1)
+        apply_mask = (torch.rand((x.shape[0], x.shape[1]), device=x.device)
+                      > self.config.bandwidth_mask_prob).unsqueeze(-1)
 
-        freq_to_mask_start = torch.randint(0, num_freqs, size=(x.shape[0], x.shape[1])).unsqueeze(-1)
-        bandwidth = torch.randint(0, math.floor(45 * self.config.ratio_of_freq_to_drop), size=(x.shape[0], x.shape[1])).unsqueeze(-1)
+        freq_to_mask_start = torch.randint(0, num_freqs,
+                                           size=(x.shape[0], x.shape[1]),
+                                           device=x.device).unsqueeze(-1)
+        bandwidth = torch.randint(0, max(1, math.floor(45 * self.config.ratio_of_freq_to_drop)),
+                                  size=(x.shape[0], x.shape[1]),
+                                  device=x.device).unsqueeze(-1)
         freq_to_mask_end = freq_to_mask_start + bandwidth
 
-        print(freq_to_mask_end.shape)
+        indices = torch.arange(num_freqs, device=x.device).reshape(1, 1, num_freqs)
 
-        indices = torch.arange(num_freqs).reshape(1, 1, num_freqs)
-
-        mask = ~(
-            (indices >= freq_to_mask_start) & (indices <= freq_to_mask_end)
-        ) # (B,C,F)
-
+        mask = ~((indices >= freq_to_mask_start) & (indices <= freq_to_mask_end))
         mask = mask | ~apply_mask
 
         return torch.fft.irfft(fft * mask, n=x.shape[2])
 
     def _amplitude_scale(self, x):
-        low, high = self.amplitude
-
-        amp = torch.zeros((x.shape[0], 1, 1)).uniform_(low, high)
-
+        low, high = self.config.amplitude
+        amp = torch.zeros((x.shape[0], 1, 1), device=x.device).uniform_(low, high)
         return x * amp
 
 class EEGProjectionHead(nn.Module):

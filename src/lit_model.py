@@ -49,12 +49,12 @@ class ContrastiveModel(L.LightningModule):
         return self.eeg_encoder(x1), self.fmri_encoder(x2)
         
     def on_after_batch_transfer(self, batch, batch_idx):
-        #applying augmentations
+        if not self.training:
+            return batch
+
         eeg, fmri = batch["eeg"], batch["fmri"]
-
-        eeg_aug = self.eeg_augmentor(eeg)
+        eeg_aug  = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
-
         return {"eeg": eeg_aug, "fmri": fmri_aug}
         
     def training_step(self, batch, batch_idx):
