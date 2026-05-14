@@ -97,7 +97,7 @@ def main():
     config = TrainConfig()
     set_seed(config.train.seed)
 
-    #train_loader, val_loader, test_loader = build_loaders(config)
+    train_loader, val_loader, test_loader = build_loaders(config)
     model = build_model(config)
 
     ckpt_dir = Path(config.train.checkpoint_dir)

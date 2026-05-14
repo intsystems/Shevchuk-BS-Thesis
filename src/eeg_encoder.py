@@ -142,6 +142,11 @@ class EEGEncoder(nn.Module):
                 n_outputs=2,
             )
 
+        if config.train.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.backbone.eval()
+
         self.projector = Projector(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -152,3 +157,10 @@ class EEGEncoder(nn.Module):
         feat = self.backbone(x, ch_names=self.ch_names, return_features=True)
         cls = feat["cls_token"]          # (B, 200)
         return self.projector(cls)       # (B, proj_out_dim)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep backbone in eval mode when frozen so dropout/BN behave correctly
+        if all(not p.requires_grad for p in self.backbone.parameters()):
+            self.backbone.eval()
+        return self

@@ -20,7 +20,7 @@ class ContrastiveModel(L.LightningModule):
             r=config.train.lora_rank,
             lora_alpha=config.train.lora_alpha,
             target_modules=["qkv"],
-            exclude_modules=["projector"],
+            modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
         )
@@ -28,7 +28,7 @@ class ContrastiveModel(L.LightningModule):
             r=config.train.lora_rank,
             lora_alpha=config.train.lora_alpha,
             target_modules=["in_proj", "out_proj", "x_proj", "dt_proj"],
-            exclude_modules=["projector"],
+            modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
         )
