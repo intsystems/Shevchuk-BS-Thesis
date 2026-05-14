@@ -85,6 +85,12 @@ class TrainingConfig:
 
     freeze_backbone: bool = True
 
+    #lora params
+    lora_rank: int = 4
+    lora_alpha: float = 4
+    lora_dropout: float = 0.05
+
+    #data
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
