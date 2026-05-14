@@ -123,7 +123,9 @@ class SimultEEG_fMRI(Dataset):
         if self.config.use_parcellation:
             fmri_tr = fmri[:, fmri_start:fmri_end].astype(np.float32)   # (n_roi, T_win)
         else:
-            fmri_tr = fmri[fmri_start:fmri_end].astype(np.float32)      # (T_win, 96, 96, 96)
+            fmri_tr = fmri[fmri_start:fmri_end].astype(np.float32)      # (T_win, X, Y, Z)
+            # downstream code (FmriAugmentor, NeuroSTORM) expects T as the last dim
+            fmri_tr = np.transpose(fmri_tr, (1, 2, 3, 0))                # (X, Y, Z, T_win)
 
         n_samples = int(self.config.eeg_win_sec * self.config.eeg_sr)
         n_ch      = self.config.n_eeg_channels

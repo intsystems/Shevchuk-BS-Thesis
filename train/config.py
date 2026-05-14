@@ -66,7 +66,7 @@ class ModelConfig:
     labram_pretrained: bool = True
 
     #Neurostorm output is (B, 288, 2, 2, 2, T)
-    Neurostorm_ckpt: str = ""
+    Neurostorm_ckpt: str = "neurostorm.ckpt"
     Neurostorm_out_dim: int = 288
 
     projector_hidden_dim: int = 256

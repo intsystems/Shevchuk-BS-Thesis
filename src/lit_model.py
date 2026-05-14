@@ -39,7 +39,7 @@ class ContrastiveModel(L.LightningModule):
         self.fmri_encoder = get_peft_model(self.fmri_encoder, fmri_lora)
 
         self.eeg_augmentor = EEGAugmentor(config)
-        self.fmri_augmentor = EEGAugmentor(config)
+        self.fmri_augmentor = FmriAugmentor(config)
 
         # buffers for accumulating val embeddings across batches
         self._val_eeg, self._val_fmri = [], []
@@ -49,10 +49,15 @@ class ContrastiveModel(L.LightningModule):
         return self.eeg_encoder(x1), self.fmri_encoder(x2)
         
     def on_after_batch_transfer(self, batch, batch_idx):
-        if not self.training:
-            return batch
-
         eeg, fmri = batch["eeg"], batch["fmri"]
+
+        # dataset stacks K HRF-shift windows: (B, K, C, T). With K=1 this dim is degenerate.
+        if eeg.dim() == 4 and eeg.size(1) == 1:
+            eeg = eeg.squeeze(1)
+
+        if not self.training:
+            return {"eeg": eeg, "fmri": fmri}
+
         eeg_aug  = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
         return {"eeg": eeg_aug, "fmri": fmri_aug}

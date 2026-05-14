@@ -181,9 +181,11 @@ class FMRIEncoderVolume(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, 1, 96, 96, 96, T)
+        x: (B, X, Y, Z, T)  — dataset/augmentor format
+        NeuroSTORM expects (B, 1, X, Y, Z, T): add the singleton channel dim.
         """
-        # forward_encoder returns (latent, mask); we only need the latent
+        if x.dim() == 5:
+            x = x.unsqueeze(1)                          # (B, 1, X, Y, Z, T)
         latent, _ = self.backbone.forward_encoder(x)   # (B, 288, 2, 2, 2, T)
         pooled = latent.mean(dim=(2, 3, 4, 5))         # (B, 288)
         return self.projector(pooled)                   # (B, proj_out_dim)
