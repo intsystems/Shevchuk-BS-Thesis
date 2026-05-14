@@ -140,16 +140,33 @@ class EEGEncoder(nn.Module):
                 p.requires_grad = False
             self.backbone.eval()
 
+        # map our channel names to LaBraM's 128-channel reference montage indices
+        # LaBraM convention: index 0 is CLS, channels start at 1 → use idx+1
+        ref_names = [c["ch_name"].upper() for c in self.backbone.chs_info]
+        idx = []
+        for c in self.ch_names:
+            cu = c.upper()
+            if cu not in ref_names:
+                raise ValueError(f"Channel {c!r} not in LaBraM reference montage")
+            idx.append(ref_names.index(cu))
+        self.register_buffer(
+            "input_chans",
+            torch.tensor(idx, dtype=torch.long) + 1,
+            persistent=False,
+        )
+
         self.projector = Projector(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, C, T)
-        returns: (B, proj_out_dim)  L2-normalized
+        returns: (B, proj_out_dim)
         """
-        feat = self.backbone(x, ch_names=self.ch_names, return_features=True)
-        cls = feat["cls_token"]          # (B, 200)
-        return self.projector(cls)       # (B, proj_out_dim)
+        # forward_features returns CLS token (B, embed_dim) when both flags are False
+        cls = self.backbone.forward_features(x, input_chans=self.input_chans)
+        if cls.dim() == 3:                # safety: (B, num_tokens, D) → take CLS
+            cls = cls[:, 0]
+        return self.projector(cls)
 
     def train(self, mode: bool = True):
         super().train(mode)
