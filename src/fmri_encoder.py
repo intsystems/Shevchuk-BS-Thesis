@@ -74,11 +74,11 @@ class FmriAugmentor:
         k = max(3, int(2 * self.config.smooth_sigma + 1))
         k = k if k % 2 == 1 else k + 1
 
-        coords = torch.arange(0, k) - k // 2 #coord grid around 0
+        coords = torch.arange(0, k, device=x.device, dtype=x.dtype) - k // 2
         g = torch.exp(-(coords)**2 / (2 * self.config.smooth_sigma ** 2))
 
         kernel = g[:, None, None] * g[None, :, None] * g[None, None, :]
-        kernel = kernel / kernel.sum() #making it an prob distr
+        kernel = kernel / kernel.sum()
         kernel = kernel[None, None, :, :, :]
 
         return F.conv3d(x, kernel, padding=k//2).reshape(B, T, X, Y, Z).permute(0,2,3,4,1)
