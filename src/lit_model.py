@@ -50,22 +50,24 @@ class ContrastiveModel(L.LightningModule):
         
     def on_after_batch_transfer(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
+        ch_names  = batch.get("ch_names")   # carried through as Python list (collate keeps it)
 
         # dataset stacks K HRF-shift windows: (B, K, C, T). With K=1 this dim is degenerate.
         if eeg.dim() == 4 and eeg.size(1) == 1:
             eeg = eeg.squeeze(1)
 
         if not self.training:
-            return {"eeg": eeg, "fmri": fmri}
+            return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names}
 
         eeg_aug  = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
-        return {"eeg": eeg_aug, "fmri": fmri_aug}
-        
+        return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names}
+
     def training_step(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
+        ch_names  = batch.get("ch_names")
 
-        eeg_pred  = self.eeg_encoder(eeg)
+        eeg_pred  = self.eeg_encoder(eeg, ch_names=ch_names)
         fmri_pred = self.fmri_encoder(fmri)
 
         K = self.config.data.num_subjects
@@ -93,7 +95,7 @@ class ContrastiveModel(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        eeg_pred  = self.eeg_encoder(batch["eeg"])
+        eeg_pred  = self.eeg_encoder(batch["eeg"], ch_names=batch.get("ch_names"))
         fmri_pred = self.fmri_encoder(batch["fmri"])
         # store on CPU to avoid filling GPU memory during long val epochs
         self._val_eeg.append(eeg_pred.detach().float().cpu())

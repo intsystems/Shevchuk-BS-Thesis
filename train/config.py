@@ -44,6 +44,7 @@ class DataConfig:
     excluded_activities: list = field(default_factory=lambda: ["task-checker", "task-rest", "task-peer"])
     fill_zeroback: bool = False
     output_h5: str = "dataset.h5"
+    channels_json: str = "eeg_channels.json"
 
     #augmentations settings
     eeg_aug: eegAug = field(default_factory=eegAug)

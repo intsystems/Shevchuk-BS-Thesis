@@ -1,6 +1,7 @@
 import os
 import re
 import copy
+import json
 import random
 from collections import defaultdict
 
@@ -17,6 +18,10 @@ class SimultEEG_fMRI(Dataset):
         super().__init__()
         self.config   = config.data
         self.subjects = set(subjects) if subjects is not None else None
+
+        # per-recording channel list: key 'sub-XX_ses-XX_task-..._run-XX'
+        with open(self.config.channels_json, "r", encoding="utf-8") as f:
+            self.channels_per_rec = json.load(f)
 
         self.pairs = []   # list of dicts
         self.index = []   # list of (pair_id, tr_idx)
@@ -59,11 +64,31 @@ class SimultEEG_fMRI(Dataset):
                 for h5_grp_path, act_key in grp_paths:
                     grp  = h5f[h5_grp_path]
                     fmri = grp["fmri"]
+                    eeg  = grp["eeg"]
+
+                    # look up native channel list for this recording
+                    rec_key = h5_grp_path.replace("/", "_")   # 'sub-03_ses-01_task-dme_run-01'
+                    rec_channels = self.channels_per_rec.get(rec_key)
+                    if rec_channels is None:
+                        # no channel info — skip rather than guess
+                        continue
+                    # h5 stores eeg as (T, C). Trust C from h5; if it doesn't match the JSON
+                    # length the JSON is from a different preprocessing run — skip.
+                    if eeg.shape[1] != len(rec_channels):
+                        continue
 
                     n_tr = fmri.shape[0] if not self.config.use_parcellation else fmri.shape[1]
 
                     min_tr = min_tr_off
-                    max_tr = n_tr - win_trs
+
+                    # max_tr is bounded by both fMRI and EEG length:
+                    # last EEG sample needed is (t_fmri - min(hrf_shifts) + eeg_win_sec) * eeg_sr
+                    max_tr_fmri = n_tr - win_trs
+                    max_t_fmri  = (eeg.shape[0] / self.config.eeg_sr
+                                   + min(self.config.hrf_shifts_sec)
+                                   - self.config.eeg_win_sec)
+                    max_tr_eeg  = int(max_t_fmri / self.config.tr)
+                    max_tr      = min(max_tr_fmri, max_tr_eeg)
 
                     if max_tr <= min_tr:
                         continue
@@ -78,6 +103,7 @@ class SimultEEG_fMRI(Dataset):
                         "run":    h5_grp_path,   # unique per recording → used by ContrastiveBatchSampler
                         "sub":    sub_id,
                         "activity": activity,
+                        "channels": rec_channels,   # list of channel names in h5 order
                     })
 
                     for tr_idx in range(min_tr, max_tr, self.config.stride_tr):
@@ -128,7 +154,7 @@ class SimultEEG_fMRI(Dataset):
             fmri_tr = np.transpose(fmri_tr, (1, 2, 3, 0))                # (X, Y, Z, T_win)
 
         n_samples = int(self.config.eeg_win_sec * self.config.eeg_sr)
-        n_ch      = self.config.n_eeg_channels
+        n_ch      = eeg.shape[1]              # native channel count for this recording
         eeg_len   = eeg.shape[0]
 
         eeg_windows = []
@@ -142,17 +168,11 @@ class SimultEEG_fMRI(Dataset):
             chunk   = eeg[r_start:r_end, :].astype(np.float32)   # (t, C)
             chunk   = chunk.T                                      # (C, t)
 
-            # pad if the window goes out of bounds
+            # pad if the window goes out of bounds (time axis only, no channel padding)
             pad_left  = max(0, -ind_start)
             pad_right = max(0, ind_end - eeg_len)
             if pad_left or pad_right:
                 chunk = np.pad(chunk, ((0, 0), (pad_left, pad_right)))
-
-            # normalise channel count
-            if chunk.shape[0] > n_ch:
-                chunk = chunk[:n_ch, :]
-            elif chunk.shape[0] < n_ch:
-                chunk = np.pad(chunk, ((0, n_ch - chunk.shape[0]), (0, 0)))
 
             if chunk.shape != (n_ch, n_samples):
                 raise RuntimeError(
@@ -165,21 +185,59 @@ class SimultEEG_fMRI(Dataset):
             eeg_windows.append(chunk)
 
         return {
-            "eeg":    torch.tensor(np.stack(eeg_windows)),  # (K, C, T)
-            "fmri":   torch.tensor(fmri_tr),                # (T_win, 96, 96, 96) or (n_roi, T_win)
-            "tr_idx": int(tr_idx),
-            "sub":    meta["sub"],
-            "run":    meta["run"],
-            "t_fmri": float(t_fmri),
-            "ts_eeg": float(ts_eeg[0]),
+            "eeg":      torch.tensor(np.stack(eeg_windows)),  # (K, C_native, T)
+            "fmri":     torch.tensor(fmri_tr),                # (X, Y, Z, T_win) or (n_roi, T_win)
+            "ch_names": info["channels"],                     # list[str], len = C_native
+            "tr_idx":   int(tr_idx),
+            "sub":      meta["sub"],
+            "run":      meta["run"],
+            "t_fmri":   float(t_fmri),
+            "ts_eeg":   float(ts_eeg[0]),
         }
 
 
 def collate_fn(batch):
-    keys_to_remove = {"tr_idx", "sub", "run", "t_fmri", "ts_eeg"}
+    """
+    Each sample may have its own EEG channel set (different recordings drop different
+    channels). To produce a single (B, C, T) tensor for LaBraM we restrict every sample
+    to the *intersection* of channel names present in the batch and select those
+    channels in a consistent canonical order.
+
+    The returned 'ch_names' is the per-batch channel list (Python list of strings)
+    that the encoder uses to build LaBraM's input_chans positional-embedding indices.
+    """
     batch = sorted(batch, key=lambda x: (x["tr_idx"], x["sub"]))
-    batch = [{k: v for k, v in elem.items() if k not in keys_to_remove} for elem in batch]
-    return {key: torch.stack([d[key] for d in batch]) for key in batch[0]}
+
+    # 1. intersection of channels across the batch
+    common = set(batch[0]["ch_names"])
+    for s in batch[1:]:
+        common &= set(s["ch_names"])
+    if not common:
+        raise RuntimeError("empty channel intersection in batch")
+
+    # 2. canonical order: by order of appearance in the first sample's ch_names
+    first_order = batch[0]["ch_names"]
+    common_ordered = [c for c in first_order if c in common]
+
+    # 3. for each sample, gather the common channels in canonical order
+    eeg_tensors  = []
+    fmri_tensors = []
+    for s in batch:
+        # column index of each common channel in this sample's native list
+        idx = torch.tensor(
+            [s["ch_names"].index(c) for c in common_ordered],
+            dtype=torch.long,
+        )
+        eeg = s["eeg"]                       # (K, C_native, T)
+        eeg = eeg.index_select(dim=-2, index=idx)   # (K, |common|, T)
+        eeg_tensors.append(eeg)
+        fmri_tensors.append(s["fmri"])
+
+    return {
+        "eeg":      torch.stack(eeg_tensors),
+        "fmri":     torch.stack(fmri_tensors),
+        "ch_names": common_ordered,
+    }
 
 
 class ContrastiveBatchSampler(Sampler):

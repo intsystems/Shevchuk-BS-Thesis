@@ -140,33 +140,32 @@ class EEGEncoder(nn.Module):
                 p.requires_grad = False
             self.backbone.eval()
 
-        # map our channel names to LaBraM's 128-channel reference montage indices
-        # LaBraM convention: index 0 is CLS, channels start at 1 → use idx+1
-        ref_names = [c["ch_name"].upper() for c in self.backbone.chs_info]
-        idx = []
-        for c in self.ch_names:
-            cu = c.upper()
-            if cu not in ref_names:
-                raise ValueError(f"Channel {c!r} not in LaBraM reference montage")
-            idx.append(ref_names.index(cu))
-        self.register_buffer(
-            "input_chans",
-            torch.cat([
-                torch.zeros(1, dtype=torch.long),         # CLS
-                torch.tensor(idx, dtype=torch.long) + 1,  # channels
-            ]),
-            persistent=False,
-        )
+        # cache LaBraM's 128-channel reference montage for ch_name → index lookup
+        # convention: positional index 0 is CLS, channels start at 1
+        self._ref_names = [c["ch_name"].upper() for c in self.backbone.chs_info]
 
         self.projector = Projector(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _build_input_chans(self, ch_names, device):
+        """Build LaBraM input_chans tensor [CLS_idx=0, ch1_idx+1, ch2_idx+1, ...]."""
+        idx = []
+        for c in ch_names:
+            cu = c.upper()
+            if cu not in self._ref_names:
+                raise ValueError(f"Channel {c!r} not in LaBraM reference montage")
+            idx.append(self._ref_names.index(cu) + 1)
+        return torch.tensor([0] + idx, dtype=torch.long, device=device)
+
+    def forward(self, x: torch.Tensor, ch_names=None) -> torch.Tensor:
         """
-        x: (B, C, T)
+        x: (B, C, T) — channels in some consistent order across the batch
+        ch_names: list of channel name strings, length C. Required.
         returns: (B, proj_out_dim)
         """
-        # forward_features returns CLS token (B, embed_dim) when both flags are False
-        cls = self.backbone.forward_features(x, input_chans=self.input_chans)
+        if ch_names is None:
+            ch_names = self.ch_names
+        input_chans = self._build_input_chans(ch_names, x.device)
+        cls = self.backbone.forward_features(x, input_chans=input_chans)
         if cls.dim() == 3:                # safety: (B, num_tokens, D) → take CLS
             cls = cls[:, 0]
         return self.projector(cls)
