@@ -285,35 +285,67 @@ def collect_eeg_channels_json(
     base_url: str = "https://fcp-indi.s3.amazonaws.com/data/Projects/NATVIEW_EEGFMRI/preproc_data_gz",
 ):
     """
-    Download NATVIEW subjects (skip if present), walk through every *_channels.tsv,
-    extract the `name` column for rows with type == 'eeg', and write a JSON file
-    keyed by the TSV filename minus '_channels.tsv'.
+    For each subject sequentially:
+      1. Download the archive
+      2. Read *_channels.tsv files directly from the tar (no extraction to disk)
+      3. Delete the archive
 
-    Example entry:
-        "sub-03_ses-01_task-dme_run-01": ["Fp1", "F3", "F4", ...]
+    At any time only one subject's archive is on disk → safe for low-storage envs.
+
+    JSON format:
+        "sub-03_ses-01_task-dme_run-01": ["Fp1", "F3", ...]
     """
-    download_natview_subjects(start_sub=start_sub, end_sub=end_sub,
-                              out_dir=out_dir, base_url=base_url)
-
-    data_dir = Path(out_dir) / "projects" / "EEG_FMRI" / "data_indi_preproc"
+    os.makedirs(out_dir, exist_ok=True)
     channels = {}
 
-    tsv_paths = sorted(data_dir.rglob("*_channels.tsv"))
-    for tsv in tqdm(tsv_paths, desc="channels.tsv"):
-        try:
-            df = pd.read_csv(tsv, sep="\t")
-            eeg_rows = df[df["type"].str.lower() == "eeg"]
-            names = eeg_rows["name"].tolist()
-        except Exception as e:
-            print(f"[ERR] {tsv.name}: {e}")
-            continue
+    for i in range(start_sub, end_sub + 1):
+        sub_id   = f"sub-{i:02d}"
+        url      = f"{base_url}/{sub_id}.tar.gz"
+        tar_path = Path(out_dir) / f"{sub_id}.tar.gz"
 
-        key = tsv.stem.replace("_channels", "")   # 'sub-03_ses-01_task-dme_run-01'
-        channels[key] = names
+        print(f"[DOWNLOAD] {sub_id}")
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            total_size = int(response.headers.get("content-length", 0))
+            with open(tar_path, "wb") as f, tqdm(
+                total=total_size, unit="B", unit_scale=True, desc=sub_id
+            ) as pbar:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+            # read channels.tsv straight from the archive
+            n_entries_before = len(channels)
+            with tarfile.open(tar_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if not member.isfile() or not member.name.endswith("_channels.tsv"):
+                        continue
+                    f = tar.extractfile(member)
+                    if f is None:
+                        continue
+                    try:
+                        df = pd.read_csv(f, sep="\t")
+                        eeg_rows = df[df["type"].str.lower() == "eeg"]
+                        names = eeg_rows["name"].tolist()
+                    except Exception as e:
+                        print(f"  [ERR] {member.name}: {e}")
+                        continue
+
+                    key = Path(member.name).stem.replace("_channels", "")
+                    channels[key] = names
+
+            print(f"[OK] {sub_id}: +{len(channels) - n_entries_before} entries")
+
+        except Exception as e:
+            print(f"[ERR] {sub_id}: {e}")
+        finally:
+            tar_path.unlink(missing_ok=True)
 
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(channels, f, indent=2)
-    print(f"[OK] wrote {len(channels)} entries → {out_json}")
+    print(f"[DONE] wrote {len(channels)} entries → {out_json}")
     return channels
 
 
