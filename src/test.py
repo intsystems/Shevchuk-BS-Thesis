@@ -190,7 +190,7 @@ def test_labram_raw():
                 'CP3', 'CP4', 'PO3', 'PO4', 'F5', 'F6', 'C5', 'C6', 'P5', 'P6',
                 'AF7', 'AF8', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8', 'Fpz', 'CPz']
 
-    B, C, T = 2, len(ch_names), 3200  # 30 sec * 200 Hz
+    B, C, T = 2, len(ch_names), 3000  # 30 sec * 200 Hz
 
     print(f"Input: ({B}, {C}, {T})")
     print("Loading pretrained LaBraM...")
@@ -491,4 +491,7 @@ if __name__ == '__main__':
     #     print(batch["fmri"].shape)
 
     # print(len(sampler))
-    test_eeg_preprocessing()
+    #test_labram_raw()
+
+    df = pd.read_csv("sub-03_ses-01_task-tp_run-02_channels.tsv", sep="\t")
+    print(df["name"])

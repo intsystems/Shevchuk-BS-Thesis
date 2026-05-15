@@ -1,12 +1,14 @@
 import mne
 import numpy as np
 import os
+import json
 import requests
 from tqdm import tqdm
 import tarfile
 import torch
 import torch.nn.functional as F
 import nibabel as nib
+import pandas as pd
 from nilearn import image
 from train.config import TrainConfig
 from pathlib import Path
@@ -273,6 +275,46 @@ def download_natview_subjects(
             tar.extractall(path=out_dir)
         tar_path.unlink()
         print(f"[DONE] {sub_id}")
+
+
+def collect_eeg_channels_json(
+    out_json: str = "eeg_channels.json",
+    start_sub: int = 1,
+    end_sub: int = 22,
+    out_dir: str = "data",
+    base_url: str = "https://fcp-indi.s3.amazonaws.com/data/Projects/NATVIEW_EEGFMRI/preproc_data_gz",
+):
+    """
+    Download NATVIEW subjects (skip if present), walk through every *_channels.tsv,
+    extract the `name` column for rows with type == 'eeg', and write a JSON file
+    keyed by the TSV filename minus '_channels.tsv'.
+
+    Example entry:
+        "sub-03_ses-01_task-dme_run-01": ["Fp1", "F3", "F4", ...]
+    """
+    download_natview_subjects(start_sub=start_sub, end_sub=end_sub,
+                              out_dir=out_dir, base_url=base_url)
+
+    data_dir = Path(out_dir) / "projects" / "EEG_FMRI" / "data_indi_preproc"
+    channels = {}
+
+    tsv_paths = sorted(data_dir.rglob("*_channels.tsv"))
+    for tsv in tqdm(tsv_paths, desc="channels.tsv"):
+        try:
+            df = pd.read_csv(tsv, sep="\t")
+            eeg_rows = df[df["type"].str.lower() == "eeg"]
+            names = eeg_rows["name"].tolist()
+        except Exception as e:
+            print(f"[ERR] {tsv.name}: {e}")
+            continue
+
+        key = tsv.stem.replace("_channels", "")   # 'sub-03_ses-01_task-dme_run-01'
+        channels[key] = names
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(channels, f, indent=2)
+    print(f"[OK] wrote {len(channels)} entries → {out_json}")
+    return channels
 
 
 def extract_all_tar_gz(out_dir="data"):

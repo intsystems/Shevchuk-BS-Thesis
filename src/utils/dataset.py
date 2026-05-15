@@ -154,6 +154,14 @@ class SimultEEG_fMRI(Dataset):
             elif chunk.shape[0] < n_ch:
                 chunk = np.pad(chunk, ((0, n_ch - chunk.shape[0]), (0, 0)))
 
+            if chunk.shape != (n_ch, n_samples):
+                raise RuntimeError(
+                    f"bad chunk shape {chunk.shape}: expected ({n_ch}, {n_samples}); "
+                    f"eeg.shape={tuple(eeg.shape)}, eeg_len={eeg_len}, "
+                    f"ind=[{ind_start}:{ind_end}], r=[{r_start}:{r_end}], "
+                    f"pad=(L={pad_left}, R={pad_right}), h5_grp={info['h5_grp']}, t_eeg={t_eeg}"
+                )
+
             eeg_windows.append(chunk)
 
         return {

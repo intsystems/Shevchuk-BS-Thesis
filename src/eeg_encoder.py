@@ -151,7 +151,10 @@ class EEGEncoder(nn.Module):
             idx.append(ref_names.index(cu))
         self.register_buffer(
             "input_chans",
-            torch.tensor(idx, dtype=torch.long) + 1,
+            torch.cat([
+                torch.zeros(1, dtype=torch.long),         # CLS
+                torch.tensor(idx, dtype=torch.long) + 1,  # channels
+            ]),
             persistent=False,
         )
 

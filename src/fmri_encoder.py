@@ -55,10 +55,10 @@ class FmriAugmentor:
     def __init__(self, config: TrainConfig):
         self.config = config.data.fmri_aug
 
-        self.smooth_sigma = config["smooth_sigma"]
-        self.noise_sigma = config["noise_sigma"]
-        self.amplitude = config["amplitude"] #tuple (low, high)
-        self.ratio_to_mask = config["ratio_to_mask"] #tuple (low, high), low and hign in [0,1]
+        self.smooth_sigma = self.config.smooth_sigma
+        self.noise_sigma = self.config.noise_sigma
+        self.amplitude = self.config.amplitude #tuple (low, high)
+        self.ratio_to_mask = self.config.ratio_to_mask #tuple (low, high), low and hign in [0,1]
     def __call__(self, x):
         #x = self._amplitude_scale(x)
         x = self._masking(x)
@@ -146,7 +146,7 @@ class FMRIProjectionHead(nn.Module):
     def __init__(self, config: TrainConfig):
         super().__init__()
 
-        self.mlp = Projector(config)
+        self.mlp = Projector(config, in_dim=config.model.Neurostorm_out_dim)
 
     def forward(self, x):
         """
@@ -183,12 +183,12 @@ class FMRIEncoderVolume(nn.Module):
         """
         x: (B, X, Y, Z, T)  — dataset/augmentor format
         NeuroSTORM expects (B, 1, X, Y, Z, T): add the singleton channel dim.
+        Projector (FMRIProjectionHead) handles the spatiotemporal pooling.
         """
         if x.dim() == 5:
             x = x.unsqueeze(1)                          # (B, 1, X, Y, Z, T)
         latent, _ = self.backbone.forward_encoder(x)   # (B, 288, 2, 2, 2, T)
-        pooled = latent.mean(dim=(2, 3, 4, 5))         # (B, 288)
-        return self.projector(pooled)                   # (B, proj_out_dim)
+        return self.projector(latent)                   # (B, proj_out_dim)
 
     def train(self, mode: bool = True):
         super().train(mode)
