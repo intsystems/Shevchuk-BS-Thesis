@@ -1,27 +1,25 @@
-# Core deep learning
+# Base & Build utilities
 numpy>=1.24.0
+packaging
+einops
+
+# Core deep learning
 lightning
+huggingface_hub
 
 # EEG processing
 mne>=1.6.0
+eeglabio
+braindecode
 
 # fMRI processing
 nibabel>=5.0.0
-
 nilearn
+monai
 
-# Training utilities
+# Training & LLM utilities
 tqdm>=4.66.0
 requests>=2.31.0
-
-eeglabio
-
 pandas
-
-braindecode
-
 transformers
-
 peft
-
-monai
