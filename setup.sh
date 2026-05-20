@@ -7,7 +7,7 @@ rm -rf NeuroSTORM
 git clone --recursive https://github.com/CUHK-AIM-Group/NeuroSTORM.git
 
 # Качаем веса NeuroSTORM
-wget -O neurostorm.ckpt "https://huggingface.co/zxcvb20001/NeuroSTORM/resolve/main/neurostorm/pt_neurostorm_mae_ratio0.5.ckpt?download=true"
+wget -O neurostorm.ckpt "https://huggingface.co/zxcvb20001/NeuroSTORM/resolve/main/pretraining/pt_neurostorm_mae_ratio0.5.ckpt?download=true"
 
 echo "=== 2. Очистка старого venv и кэша пакетов ==="
 rm -rf .venv
@@ -26,7 +26,6 @@ pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pyt
 echo "=== 5. Установка основного стека из requirements.txt ==="
 pip install -r requirements.txt
 
-echo "=== 6. Быстрая установка готовых колес Mamba-2 (Без компиляции) ==="
 wget https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.3.post2/causal_conv1d-1.5.3.post1+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 pip install causal_conv1d-1.5.3.post1+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 rm causal_conv1d-*.whl

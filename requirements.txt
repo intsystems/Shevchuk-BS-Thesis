@@ -1,11 +1,18 @@
-# Base & Build utilities
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+transformers>=4.44.0,<4.46.0
+tokenizers>=0.20,<0.21
+huggingface-hub>=0.23.2,<1.0
+
 numpy>=1.24.0
 packaging
 einops
 
 # Core deep learning
 lightning
-huggingface_hub
 
 # EEG processing
 mne>=1.6.0
@@ -21,5 +28,6 @@ monai
 tqdm>=4.66.0
 requests>=2.31.0
 pandas
-transformers
 peft
+
+tensorboard
