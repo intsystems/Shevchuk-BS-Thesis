@@ -8,23 +8,23 @@ wget -O neurostorm.ckpt "https://huggingface.co/zxcvb20001/NeuroSTORM/resolve/ma
 
 echo "=== 2. Создание venv с наследованием ЗАВОДСКОГО PyTorch ==="
 # Мы забираем идеальный, протестированный Google/NVIDIA торч из системы
-python3 -m venv .venv --system-site-packages
+python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip setuptools wheel
 
-echo "=== 3. Установка пакетов диплома ==="
-# Ставим только твои библиотеки, pip не будет трогать системный torch
+echo "=== 3. Установка torch cu128 (как в Colab) ==="
+pip install torch==2.10.0 torchvision==0.21.0 torchaudio==2.10.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+echo "=== 4. Установка пакетов диплома ==="
 pip install -r requirements.txt
 
-echo "=== 4. Установка официальных колес Mamba-2 ==="
-# Просто скачиваем готовые бинарники, они встанут за 3 секунды без компиляции
-wget https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0/causal_conv1d-1.5.0+cu124torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-pip install causal_conv1d-1.5.0+cu124torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl --no-deps --force-reinstall
+echo "=== 5. Установка официальных колес Mamba-2 для torch2.10 ==="
+wget https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+pip install causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl --no-deps --force-reinstall
 
-wget https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0+cu124torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-pip install mamba_ssm-2.3.0+cu124torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl --no-deps --force-reinstall
-
-rm *.whl
+wget https://github.com/state-spaces/mamba/releases/download/v2.3.2.post1/mamba_ssm-2.3.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+pip install https://github.com/state-spaces/mamba/releases/download/v2.3.2.post1/mamba_ssm-2.3.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl --no-deps --force-reinstall
 
 echo "=== 5. Загрузка датасета ==="
 gcloud storage cp gs://fmrieeg-thesis-iowa/dataset.h5 .
