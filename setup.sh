@@ -13,7 +13,7 @@ source .venv/bin/activate
 pip install --upgrade pip setuptools wheel
 
 echo "=== 3. Установка torch cu128 (как в Colab) ==="
-pip install torch==2.10.0 torchvision==0.21.0 torchaudio==2.10.0 \
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
     --index-url https://download.pytorch.org/whl/cu128
 
 echo "=== 4. Установка пакетов диплома ==="

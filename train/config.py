@@ -100,6 +100,17 @@ class TrainingConfig:
     num_workers: int = 0
     save_every:int = 5
 
+    using_aug: bool = False
+    grad_clip_val: float = 1.0
+
+    # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same
+    # batch every step; max_steps=-1 disables step limit (combine with num_epochs).
+    overfit_batches: int = 1
+    max_steps: int = 500
+
+    wandb_project: str = "shevchuk-bs-thesis"
+    wandb_run_name: str = "contrastive_eeg_fmri"
+
 @dataclass
 class TrainConfig:
     model: ModelConfig = field(default_factory=ModelConfig)

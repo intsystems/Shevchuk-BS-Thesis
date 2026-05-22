@@ -56,7 +56,7 @@ class ContrastiveModel(L.LightningModule):
         if eeg.dim() == 4 and eeg.size(1) == 1:
             eeg = eeg.squeeze(1)
 
-        if not self.training:
+        if not self.training or not self.config.train.using_aug:
             return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names}
 
         eeg_aug  = self.eeg_augmentor(eeg)
@@ -81,6 +81,11 @@ class ContrastiveModel(L.LightningModule):
         backbone_opt.zero_grad()
         projector_opt.zero_grad()
         self.manual_backward(loss)
+
+        trainable = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=self.config.train.grad_clip_val)
+        self.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False)
+
         backbone_opt.step()
         projector_opt.step()
 
@@ -98,15 +103,15 @@ class ContrastiveModel(L.LightningModule):
         eeg_pred  = self.eeg_encoder(batch["eeg"], ch_names=batch.get("ch_names"))
         fmri_pred = self.fmri_encoder(batch["fmri"])
         # store on CPU to avoid filling GPU memory during long val epochs
-        self._val_eeg.append(eeg_pred.detach().float().cpu())
-        self._val_fmri.append(fmri_pred.detach().float().cpu())
+        self._val_eeg.append(eeg_pred.detach())
+        self._val_fmri.append(fmri_pred.detach())
 
     def on_validation_epoch_end(self):
         if not self._val_eeg:
             return
 
-        z_e = torch.cat(self._val_eeg, dim=0)   # [B, D]
-        z_f = torch.cat(self._val_fmri, dim=0)
+        z_e = torch.cat(self._val_eeg, dim=0).float()   # [B, D]
+        z_f = torch.cat(self._val_fmri, dim=0).float()
         self._val_eeg.clear()
         self._val_fmri.clear()
 

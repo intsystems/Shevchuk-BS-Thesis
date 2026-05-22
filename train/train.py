@@ -1,11 +1,12 @@
 import torch
 import numpy as np
 import random
+from dataclasses import asdict
 from pathlib import Path
 
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
 from src.eeg_encoder import EEGEncoder
@@ -116,21 +117,31 @@ def main():
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
-    logger = TensorBoardLogger(save_dir="logs", name="contrastive_eeg_fmri")
+    logger = WandbLogger(
+        project=config.train.wandb_project,
+        name=config.train.wandb_run_name,
+        save_dir="logs",
+        config=asdict(config),
+    )
 
     trainer = L.Trainer(
-        max_epochs=config.train.num_epochs,
+        max_epochs=-1,
+        max_steps=config.train.max_steps,
+        overfit_batches=config.train.overfit_batches,
         accelerator="auto",
         devices="auto",
-        precision="16-mixed" if torch.cuda.is_available() else 32,
+        precision="bf16-mixed" if torch.cuda.is_available() else 32,
         callbacks=callbacks,
         logger=logger,
-        log_every_n_steps=10,
-        gradient_clip_val=None,  # manual optimization → clipping must be done inside training_step if needed
+        log_every_n_steps=1 if config.train.overfit_batches else 10,
+        num_sanity_val_steps=0 if config.train.overfit_batches else 2,
+        check_val_every_n_epoch=10**9 if config.train.overfit_batches else 1,
+        gradient_clip_val=None,  # manual optimization → clipping done in training_step via clip_grad_norm_
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    trainer.test(model, dataloaders=test_loader)
+    if not config.train.overfit_batches:
+        trainer.test(model, dataloaders=test_loader)
 
 
 if __name__ == "__main__":
