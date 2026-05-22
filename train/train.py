@@ -119,7 +119,7 @@ def main():
 
     logger = WandbLogger(
         project=config.train.wandb_project,
-        name=config.train.wandb_run_name,
+        group=config.train.wandb_group,
         save_dir="logs",
         config=asdict(config),
     )

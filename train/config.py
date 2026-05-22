@@ -109,7 +109,7 @@ class TrainingConfig:
     max_steps: int = 500
 
     wandb_project: str = "shevchuk-bs-thesis"
-    wandb_run_name: str = "contrastive_eeg_fmri"
+    wandb_group: str = "overfit_sanity"
 
 @dataclass
 class TrainConfig:
