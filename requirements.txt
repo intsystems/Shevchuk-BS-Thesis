@@ -26,3 +26,4 @@ pandas
 peft
 
 tensorboard
+wandb>=0.12.10

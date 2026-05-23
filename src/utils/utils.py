@@ -87,7 +87,7 @@ def effective_rank(z: torch.Tensor) -> torch.Tensor:
     z: [B, D]  batch of (optionally unnormalized) embeddings
     """
     with torch.no_grad():
-        sigma = torch.linalg.svdvals(z.float())   # [min(B,D)]
+        sigma = torch.linalg.svdvals(z.float().cpu())   # [min(B,D)]
         sigma = sigma[sigma > 0]
         p = sigma / sigma.sum()
         entropy = -(p * p.log()).sum()

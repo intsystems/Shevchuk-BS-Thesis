@@ -62,7 +62,7 @@ class EEGAugmentor:
     
     def _channel_drop(self, x):
         mask = torch.bernoulli(
-            torch.ones(x.shape[0], x.shape[1], 1, device=x.device) * self.config.channel_drop_prob
+            torch.ones(x.shape[0], x.shape[1], 1, device=x.device) * (1 - self.config.channel_drop_prob)
         )
         return x * mask
 
@@ -143,18 +143,22 @@ class EEGEncoder(nn.Module):
         # cache LaBraM's 128-channel reference montage for ch_name → index lookup
         # convention: positional index 0 is CLS, channels start at 1
         self._ref_names = [c["ch_name"].upper() for c in self.backbone.chs_info]
+        self._input_chans_cache: dict[tuple, torch.Tensor] = {}
 
         self.projector = Projector(config)
 
     def _build_input_chans(self, ch_names, device):
         """Build LaBraM input_chans tensor [CLS_idx=0, ch1_idx+1, ch2_idx+1, ...]."""
-        idx = []
-        for c in ch_names:
-            cu = c.upper()
-            if cu not in self._ref_names:
-                raise ValueError(f"Channel {c!r} not in LaBraM reference montage")
-            idx.append(self._ref_names.index(cu) + 1)
-        return torch.tensor([0] + idx, dtype=torch.long, device=device)
+        key = tuple(ch_names)
+        if key not in self._input_chans_cache:
+            idx = []
+            for c in ch_names:
+                cu = c.upper()
+                if cu not in self._ref_names:
+                    raise ValueError(f"Channel {c!r} not in LaBraM reference montage")
+                idx.append(self._ref_names.index(cu) + 1)
+            self._input_chans_cache[key] = torch.tensor([0] + idx, dtype=torch.long)
+        return self._input_chans_cache[key].to(device)
 
     def forward(self, x: torch.Tensor, ch_names=None) -> torch.Tensor:
         """

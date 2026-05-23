@@ -198,6 +198,20 @@ class FMRIEncoderVolume(nn.Module):
         return self
 
 
+class FMRIEncoderFromFeatures(nn.Module):
+    """
+    Lightweight fMRI encoder used when backbone features are precomputed.
+    Input:  (B, Neurostorm_out_dim)  — precomputed pooled backbone features
+    Output: (B, proj_out_dim)        — L2-normalized embedding
+    """
+    def __init__(self, config: TrainConfig):
+        super().__init__()
+        self.projector = Projector(config, in_dim=config.model.Neurostorm_out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.projector(x)
+
+
 class FMRIEncoder1D(nn.Module):
     """
     MLP encoder for parcellated fMRI ROI vectors.

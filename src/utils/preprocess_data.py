@@ -151,7 +151,6 @@ def _process_subject(sub_id, fmri_files, tmp_path, config):
     """Write one subject into a fresh tmp h5. Returns True if any data was written."""
     wrote_any = False
     with h5py.File(tmp_path, 'w') as tmp:
-        first_eeg_done = False
         for f_path in tqdm(fmri_files, desc=sub_id):
             if any(excl in f_path.parents[1].name for excl in config.data.excluded_activities):
                 continue
@@ -166,20 +165,25 @@ def _process_subject(sub_id, fmri_files, tmp_path, config):
             grp = f"{sub_id}/{ses_id[0]}/{activity}"
 
             try:
-                fmri_data = preprocess_fmri(f_path, config)
-                fmri_data = fmri_data.to(torch.float16).permute(3, 0, 1, 2)
-
                 task_name = f_path.parents[1].name.replace("_bold", "")
                 eeg_npy = f_path.parents[3] / "eeg" / f"{task_name}_eeg.npy"
                 eeg_set = eeg_npy.with_suffix(".set")
 
-
                 preprocess_eeg(eeg_set, config)
                 eeg_data = np.load(eeg_npy).astype(np.float16).T  # (T_eeg, C)
 
-                tmp.create_dataset(f"{grp}/fmri", data=fmri_data,
-                                   chunks=(1, 96, 96, 96),
-                                   compression="lzf", shuffle=True)
+                if config.data.use_parcellation:
+                    fmri_data = preprocess_parcellated_fmri(f_path, n_roi=config.model.n_roi)
+                    tmp.create_dataset(f"{grp}/fmri", data=fmri_data,
+                                       chunks=(config.model.n_roi, 1),
+                                       compression="lzf", shuffle=True)
+                else:
+                    fmri_data = preprocess_fmri(f_path, config)
+                    fmri_data = fmri_data.to(torch.float16).permute(3, 0, 1, 2)
+                    tmp.create_dataset(f"{grp}/fmri", data=fmri_data,
+                                       chunks=(1, 96, 96, 96),
+                                       compression="lzf", shuffle=True)
+
                 tmp.create_dataset(f"{grp}/eeg", data=eeg_data,
                                    chunks=(int(config.data.tr * config.data.eeg_sr),
                                     eeg_data.shape[1]),
@@ -213,7 +217,7 @@ def preprocess_dataset(config: TrainConfig):
         download_natview_subjects(start_sub=i, end_sub=i)
 
         if config.data.use_parcellation:
-            fmri_files = list((dataset_path / sub_id).rglob("*" + config.data.parcellation_suffix + ".nii.gz"))
+            fmri_files = list((dataset_path / sub_id).rglob("*" + config.data.parcellation_suffix + ".tsv"))
         else:
             fmri_files = list((dataset_path / sub_id).rglob(config.data.no_parcellation_prefix + "*.nii.gz"))
 
@@ -366,7 +370,28 @@ def extract_all_tar_gz(out_dir="data"):
         except Exception as e:
             print(f"  [ERROR] {fname}: {e}")
 
+def preprocess_parcellated_fmri(path: Path, n_roi: int = 200) -> np.ndarray:
+    """
+    Load a parcellated fMRI TSV file and return (n_roi, T) float32.
+
+    Handles both (T, n_roi) and (n_roi, T) layouts.
+    Z-normalises each ROI time series independently.
+    """
+    data = pd.read_csv(path, sep="\t", header=None).values.astype(np.float32)
+
+    if data.shape[0] == n_roi:
+        pass                      # (n_roi, T) — correct
+    elif data.shape[1] == n_roi:
+        data = data.T             # (T, n_roi) → (n_roi, T)
+    else:
+        raise ValueError(f"Neither dim matches n_roi={n_roi}: shape={data.shape} in {path}")
+
+    mu  = data.mean(axis=1, keepdims=True)
+    std = data.std(axis=1,  keepdims=True)
+    data = (data - mu) / (std + 1e-8)
+    return data.astype(np.float32)
+
+
 if __name__ == "__main__":
     config = TrainConfig()
-
     preprocess_dataset(config)

@@ -15,7 +15,7 @@ class eegAug:
     channel_drop_prob: float = 0.2 #float in [0,1]
     ratio_of_freq_to_drop: float = 0.2 #float in [0,1]
     bandwidth_mask_prob: float = 0.2 #float in [0,1]
-    amplitude: tuple = (0, 0)#tuple, low, high
+    amplitude: tuple = (0.8, 1.2)#tuple, low, high
 
 @dataclass
 class DataConfig:
@@ -25,7 +25,7 @@ class DataConfig:
     eeg_sr: int = 200
     tr: float = 2.1 #sampling rate of fmri, in sec
     eeg_win_sec: int = 15 #window size, for eeg and fmri, in sec
-    hrf_shifts_sec: list = field(default_factory=lambda: [4.2])
+    hrf_shifts_sec: list = field(default_factory=lambda: [2.1, 4.2, 6.3])
     stride_tr: int = 1 #shift inside one activity, in trs
     n_eeg_channels: int = 60
     ch_names: list = field(default_factory=lambda: ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T7', 'T8', 'P7', 'P8', 'Fz', 'Cz', 'Pz', 'Oz', 'FC1', 'FC2', 'CP1', 'CP2', 'FC5', 'FC6', 'CP5', 'CP6', 'TP9', 'TP10', 'POz', 'F1', 'F2', 'C1', 'C2', 'P1', 'P2', 'AF3', 'AF4', 'FC3', 'CP3', 'CP4', 'PO3', 'PO4', 'F5', 'F6', 'C5', 'C6', 'P5', 'P6', 'AF7', 'AF8', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8', 'Fpz', 'CPz'])
@@ -53,7 +53,7 @@ class DataConfig:
     #batch sampler settings:
     num_timestamps: int = 8 #number of timesteps inside activity used in batch
     num_subjects: int = 16 #number of subject per activity
-    margin_tr: int = 15 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation) 
+    margin_tr: int = 5 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation) 
 
 @dataclass
 class ModelConfig:
@@ -69,27 +69,32 @@ class ModelConfig:
     #Neurostorm output is (B, 288, 2, 2, 2, T)
     Neurostorm_ckpt: str = "neurostorm.ckpt"
     Neurostorm_out_dim: int = 288
+    fmri_features_h5: str = "fmri_features.h5"
 
     projector_hidden_dim: int = 256
     projector_out_dim: int = 128
+    use_precomputed_fmri: bool = False
 
 @dataclass
 class TrainingConfig:
     checkpoint_dir: str = "checkpoints/"
     #training params
     batch_size: int = 64
-    backbone_lr: float = 1e-4
-    proj_lr: float = 1e-5
-    weight_decay: float = 5e-2
+    backbone_lr: float = 2e-4
+    proj_lr: float = 2e-3
+    weight_decay: float = 0.0
+    warmup_steps: int = 50
     num_epochs:int = 100
-    tau: float = 0.1 #for infonce loss
+    tau: float = 0.07 #for infonce loss
 
     freeze_backbone: bool = True
 
     #lora params
-    lora_rank: int = 4
-    lora_alpha: float = 4
-    lora_dropout: float = 0.05
+    eeg_lora_rank: int = 64
+    eeg_lora_alpha: float = 32
+    fmri_lora_rank: int = 128
+    fmri_lora_alpha: float = 64
+    lora_dropout: float = 0.0
 
     #data
     train_ratio: float = 0.8
@@ -97,7 +102,7 @@ class TrainingConfig:
     test_ratio: float = 0.1
     
     seed: int = 42
-    num_workers: int = 0
+    num_workers: int = 8
     save_every:int = 5
 
     using_aug: bool = False
@@ -105,11 +110,13 @@ class TrainingConfig:
 
     # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same
     # batch every step; max_steps=-1 disables step limit (combine with num_epochs).
-    overfit_batches: int = 1
-    max_steps: int = 500
+    overfit_batches: int = 0
+    max_steps: int = 10000
 
     wandb_project: str = "shevchuk-bs-thesis"
-    wandb_group: str = "overfit_sanity"
+    wandb_group: str = "overfit-train"
+
+    profile: bool = False  # run torch.profiler for a few steps then exit
 
 @dataclass
 class TrainConfig:

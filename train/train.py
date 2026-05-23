@@ -13,7 +13,7 @@ from src.eeg_encoder import EEGEncoder
 from src.fmri_encoder import FMRIEncoderVolume, FMRIEncoder1D
 from src.lit_model import ContrastiveModel
 from src.utils.dataset import SimultEEG_fMRI, ContrastiveBatchSampler, collate_fn
-from src.utils.utils import count_params
+from src.utils.utils import count_params, multi_positive_clip_loss
 from train.config import TrainConfig
 
 
@@ -50,30 +50,42 @@ def build_loaders(config: TrainConfig):
     test_ds  = SimultEEG_fMRI(config, subjects=test_subs)
 
     train_sampler = ContrastiveBatchSampler(train_ds, config)
+    nw = config.train.num_workers
+    # Workers are spawned (not forked) so each starts fresh without inheriting
+    # the parent's model weights in CPU memory (~6 GB per forked worker → OOM with 8 workers).
+    ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
-        num_workers=config.train.num_workers,
+        num_workers=nw,
         collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
+        prefetch_factor=1 if nw > 0 else None,
+        persistent_workers=nw > 0,
+        multiprocessing_context=ctx,
     )
 
-    # val/test: simple sequential — used for retrieval metrics, not contrastive batches
     val_loader = DataLoader(
         val_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
-        num_workers=config.train.num_workers,
+        num_workers=nw,
         collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
+        prefetch_factor=1 if nw > 0 else None,
+        persistent_workers=nw > 0,
+        multiprocessing_context=ctx,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
-        num_workers=config.train.num_workers,
+        num_workers=nw,
         collate_fn=collate_fn,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
+        prefetch_factor=1 if nw > 0 else None,
+        persistent_workers=nw > 0,
+        multiprocessing_context=ctx,
     )
     return train_loader, val_loader, test_loader
 
@@ -94,11 +106,105 @@ def build_model(config: TrainConfig):
     return ContrastiveModel(eeg_encoder, fmri_encoder, config)
 
 
+def profile_run(config: TrainConfig, n_steps: int = 8):
+    """
+    Run a few forward/backward passes under torch.profiler to pinpoint the bottleneck.
+    Writes a Chrome trace to logs/profiler/ (open with chrome://tracing or Perfetto).
+    Prints a summary table sorted by CPU and CUDA time.
+    """
+    from torch.profiler import (
+        profile, record_function, ProfilerActivity,
+        schedule, tensorboard_trace_handler,
+    )
+
+    train_loader, _, _ = build_loaders(config)
+    model = build_model(config).cuda().train()
+    opt1, opt2 = model.configure_optimizers()
+    device = next(model.parameters()).device
+
+    Path("logs/profiler").mkdir(parents=True, exist_ok=True)
+    wait, warmup, active = 1, 2, n_steps
+    loader_iter = iter(train_loader)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(wait=wait, warmup=warmup, active=active, repeat=1),
+        on_trace_ready=tensorboard_trace_handler("logs/profiler"),
+        record_shapes=False,
+        with_stack=False,
+    ) as prof:
+        for step in range(wait + warmup + active):
+            with record_function("data_load"):
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    loader_iter = iter(train_loader)
+                    batch = next(loader_iter)
+
+            with record_function("to_gpu"):
+                eeg      = batch["eeg"].to(device)
+                fmri     = batch["fmri"].to(device)
+                ch_names = batch.get("ch_names")
+                if eeg.dim() == 4 and eeg.size(1) == 1:
+                    eeg = eeg.squeeze(1)
+
+            with record_function("forward"):
+                eeg_pred  = model.eeg_encoder(eeg, ch_names=ch_names)
+                fmri_pred = model.fmri_encoder(fmri)
+                K, D = config.data.num_subjects, eeg_pred.shape[-1]
+                loss = multi_positive_clip_loss(
+                    fmri_pred.reshape(-1, K, D),
+                    eeg_pred.reshape(-1, K, D),
+                    config.train.tau,
+                )
+
+            with record_function("backward"):
+                opt1.zero_grad()
+                opt2.zero_grad()
+                loss.backward()
+                opt1.step()
+                opt2.step()
+
+            prof.step()
+
+    print("\n=== Bottleneck report — sorted by CPU time ===")
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=15))
+    print("\n=== Bottleneck report — sorted by CUDA time ===")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+    print("\nChrome trace written to logs/profiler/ — open with Perfetto (https://ui.perfetto.dev)")
+
+
 def main():
     config = TrainConfig()
     set_seed(config.train.seed)
 
+    if config.train.profile:
+        profile_run(config)
+        return
+
     train_loader, val_loader, test_loader = build_loaders(config)
+
+    # overfit_batches=N doesn't cache — it re-reads from HDF5 and re-transfers
+    # CPU→GPU every step. Pre-load once and park the batch on GPU so the
+    # transfer (0.3s/step per profiler) becomes a no-op on every subsequent step.
+    if config.train.overfit_batches:
+        print("[OVERFIT] Pre-loading single batch onto GPU to avoid per-step H2D transfer...")
+        _cached_cpu = next(iter(train_loader))
+        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _cached = {
+            k: v.to(_device) if isinstance(v, torch.Tensor) else v
+            for k, v in _cached_cpu.items()
+        }
+        del _cached_cpu
+
+        class _CachedLoader:
+            def __iter__(self):
+                yield _cached
+            def __len__(self):
+                return 1
+
+        train_loader = _CachedLoader()
+
     model = build_model(config)
 
     ckpt_dir = Path(config.train.checkpoint_dir)
@@ -107,9 +213,9 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath=ckpt_dir,
-            filename="epoch={epoch:02d}-loss={train_loss:.4f}",
-            monitor="train_loss",
-            mode="min",
+            filename="epoch={epoch:02d}-mrr={val/mrr_e2f:.4f}",
+            monitor="val/mrr_e2f",
+            mode="max",
             save_top_k=3,
             every_n_epochs=config.train.save_every,
             save_last=True,

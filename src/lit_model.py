@@ -17,16 +17,16 @@ class ContrastiveModel(L.LightningModule):
         self.fmri_encoder = fmri_encoder
 
         eeg_lora = LoraConfig(
-            r=config.train.lora_rank,
-            lora_alpha=config.train.lora_alpha,
+            r=config.train.eeg_lora_rank,
+            lora_alpha=config.train.eeg_lora_alpha,
             target_modules=["qkv"],
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
         )
         fmri_lora = LoraConfig(
-            r=config.train.lora_rank,
-            lora_alpha=config.train.lora_alpha,
+            r=config.train.fmri_lora_rank,
+            lora_alpha=config.train.fmri_lora_alpha,
             target_modules=["in_proj", "out_proj", "x_proj", "dt_proj"],
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
@@ -46,11 +46,25 @@ class ContrastiveModel(L.LightningModule):
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor):
         x2 = x2.unsqueeze(1) #shape will be (B, 1, X, Y, Z, T)
-        return self.eeg_encoder(x1), self.fmri_encoder(x2)
+        return self._encode_eeg(x1), self.fmri_encoder(x2)
+
+    def _encode_eeg(self, eeg: torch.Tensor, ch_names=None) -> torch.Tensor:
+        """
+        eeg: (B, C, T) with single HRF shift, or (B, n_shifts, C, T) with multiple.
+        For multiple shifts: encode each shift sequentially to avoid n_shifts × memory spike,
+        then average embeddings to get an HRF-robust representation.
+        """
+        if eeg.dim() == 3:
+            return self.eeg_encoder(eeg, ch_names=ch_names)
+        embs = [self.eeg_encoder(eeg[:, i], ch_names=ch_names) for i in range(eeg.size(1))]
+        return torch.stack(embs, dim=1).mean(dim=1)    # (B, D)
         
     def on_after_batch_transfer(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
         ch_names  = batch.get("ch_names")   # carried through as Python list (collate keeps it)
+
+        # fMRI is kept as float16 through CPU/worker pipeline to halve memory; cast here on GPU.
+        fmri = fmri.float()
 
         # dataset stacks K HRF-shift windows: (B, K, C, T). With K=1 this dim is degenerate.
         if eeg.dim() == 4 and eeg.size(1) == 1:
@@ -67,7 +81,7 @@ class ContrastiveModel(L.LightningModule):
         eeg, fmri = batch["eeg"], batch["fmri"]
         ch_names  = batch.get("ch_names")
 
-        eeg_pred  = self.eeg_encoder(eeg, ch_names=ch_names)
+        eeg_pred  = self._encode_eeg(eeg, ch_names=ch_names)
         fmri_pred = self.fmri_encoder(fmri)
 
         K = self.config.data.num_subjects
@@ -78,6 +92,7 @@ class ContrastiveModel(L.LightningModule):
         loss = multi_positive_clip_loss(fmri_mk, eeg_mk, self.config.train.tau)
 
         backbone_opt, projector_opt = self.optimizers()
+        backbone_sched, projector_sched = self.lr_schedulers()
         backbone_opt.zero_grad()
         projector_opt.zero_grad()
         self.manual_backward(loss)
@@ -88,6 +103,8 @@ class ContrastiveModel(L.LightningModule):
 
         backbone_opt.step()
         projector_opt.step()
+        backbone_sched.step()
+        projector_sched.step()
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
 
@@ -97,10 +114,27 @@ class ContrastiveModel(L.LightningModule):
             self.log("train/erank_fmri", effective_rank(fmri_pred))
             self.log("train/align",      alignment_metric(fmri_mk, eeg_mk))
 
+            # pos vs neg similarity gap — direct collapse indicator
+            B, D = eeg_pred.shape
+            zf = F.normalize(fmri_pred, dim=-1)
+            ze = F.normalize(eeg_pred,  dim=-1)
+            sim = zf @ ze.T                          # [B, B]
+            K   = self.config.data.num_subjects
+            T   = B // K
+            mask_pos = torch.kron(
+                torch.eye(T, device=sim.device),
+                torch.ones(K, K, device=sim.device),
+            ).bool()
+            sim_pos = sim[mask_pos].mean()
+            sim_neg = sim[~mask_pos].mean()
+            self.log("train/sim_pos", sim_pos)
+            self.log("train/sim_neg", sim_neg)
+            self.log("train/sim_gap", sim_pos - sim_neg, prog_bar=True)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        eeg_pred  = self.eeg_encoder(batch["eeg"], ch_names=batch.get("ch_names"))
+        eeg_pred  = self._encode_eeg(batch["eeg"], ch_names=batch.get("ch_names"))
         fmri_pred = self.fmri_encoder(batch["fmri"])
         # store on CPU to avoid filling GPU memory during long val epochs
         self._val_eeg.append(eeg_pred.detach())
@@ -159,4 +193,23 @@ class ContrastiveModel(L.LightningModule):
             lr=self.config.train.proj_lr,
             weight_decay=self.config.train.weight_decay,
         )
-        return [backbone_opt, projector_opt]
+        def make_scheduler(opt):
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                opt, start_factor=0.1, end_factor=1.0,
+                total_iters=self.config.train.warmup_steps,
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
+            )
+            return torch.optim.lr_scheduler.SequentialLR(
+                opt, schedulers=[warmup, cosine],
+                milestones=[self.config.train.warmup_steps],
+            )
+
+        return (
+            [backbone_opt, projector_opt],
+            [
+                {"scheduler": make_scheduler(backbone_opt), "interval": "step"},
+                {"scheduler": make_scheduler(projector_opt), "interval": "step"},
+            ],
+        )

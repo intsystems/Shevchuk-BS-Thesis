@@ -16,15 +16,18 @@ from train.config import TrainConfig
 class SimultEEG_fMRI(Dataset):
     def __init__(self, config: TrainConfig, subjects: list = None):
         super().__init__()
-        self.config   = config.data
-        self.subjects = set(subjects) if subjects is not None else None
+        self.config              = config.data
+        self.using_aug           = config.train.using_aug
+        self.use_precomputed_fmri = config.model.use_precomputed_fmri
+        self.fmri_features_h5   = config.model.fmri_features_h5
+        self.subjects            = set(subjects) if subjects is not None else None
 
         # per-recording channel list: key 'sub-XX_ses-XX_task-..._run-XX'
         with open(self.config.channels_json, "r", encoding="utf-8") as f:
             self.channels_per_rec = json.load(f)
 
         self.pairs = []   # list of dicts
-        self.index = []   # list of (pair_id, tr_idx)
+        self._index_list = []   # list of (pair_id, tr_idx), converted to np array after build
         self.meta  = []
 
         self._build_pairs_and_index()
@@ -33,8 +36,8 @@ class SimultEEG_fMRI(Dataset):
     def from_subset(cls, dataset, indices):
         new_ds = cls.__new__(cls)
         new_ds.__dict__ = copy.deepcopy(dataset.__dict__)
-        new_ds.index = [dataset.index[i] for i in indices]
-        new_ds.meta  = [dataset.meta[i]  for i in indices]
+        new_ds.index = dataset.index[indices]          # numpy fancy index → new contiguous array
+        new_ds.meta  = [dataset.meta[i] for i in indices]
         return new_ds
 
     def __len__(self):
@@ -107,11 +110,14 @@ class SimultEEG_fMRI(Dataset):
                     })
 
                     for tr_idx in range(min_tr, max_tr, self.config.stride_tr):
-                        self.index.append((pair_id, tr_idx))
+                        self._index_list.append((pair_id, tr_idx))
                         self.meta.append({"sub": sub_id, "run": act_key, "activity": activity, "tr": tr_idx})
 
-        if len(self.index) == 0:
+        if len(self._index_list) == 0:
             raise RuntimeError("No fMRI/EEG pairs found in h5 file")
+        # numpy array avoids Python ref-count copy-on-write in DataLoader workers
+        self.index = np.array(self._index_list, dtype=np.int64)  # (N, 2)
+        del self._index_list
 
     def _get_h5(self):
         """Per-process cached h5 file handle (safe with DataLoader workers)."""
@@ -123,35 +129,60 @@ class SimultEEG_fMRI(Dataset):
                     cache["file"].close()
                 except Exception:
                     pass
-            self._h5_cache = {"pid": pid, "file": h5py.File(self.config.output_h5, 'r')}
+            # rdcc_nbytes: limit chunk cache to 64 MB per worker (default is unlimited growth)
+            self._h5_cache = {"pid": pid, "file": h5py.File(
+                self.config.output_h5, 'r', rdcc_nbytes=64 * 1024 * 1024
+            )}
         return self._h5_cache["file"]
+
+    def _get_features_h5(self):
+        """Per-process cached handle for precomputed fMRI features."""
+        pid = os.getpid()
+        cache = getattr(self, "_feat_cache", None)
+        if cache is None or cache["pid"] != pid:
+            if cache is not None:
+                try:
+                    cache["file"].close()
+                except Exception:
+                    pass
+            self._feat_cache = {"pid": pid, "file": h5py.File(self.fmri_features_h5, 'r')}
+        return self._feat_cache["file"]
 
     def __getitem__(self, idx):
         pair_id, tr_idx = self.index[idx]
         meta = self.meta[idx]
         info = self.pairs[pair_id]
 
-        h5f  = self._get_h5()
-        grp  = h5f[info["h5_grp"]]
-        fmri = grp["fmri"]   # (T, 96, 96, 96) or (n_roi, T)
-        eeg  = grp["eeg"]    # (T_eeg, C)
+        h5f = self._get_h5()
+        grp = h5f[info["h5_grp"]]
+        eeg = grp["eeg"]    # (T_eeg, C)
 
-        n_fmri_frames = fmri.shape[0] if not self.config.use_parcellation else fmri.shape[1]
-        tr_idx = min(max(tr_idx + random.choice(self.config.fmri_aug.tr_jitter), 0),
-                     n_fmri_frames - 1)
+        if self.use_precomputed_fmri:
+            jitter = random.choice(self.config.fmri_aug.tr_jitter) if self.using_aug else 0
+            tr_idx = int(tr_idx) + jitter
+            feat_h5 = self._get_features_h5()
+            feat_grp = feat_h5[info["h5_grp"]]
+            tr_indices = feat_grp["tr_indices"][:]           # (M,) sorted int array
+            pos = np.searchsorted(tr_indices, tr_idx)
+            pos = int(np.clip(pos, 0, len(tr_indices) - 1))
+            fmri_tr = feat_grp["features"][pos]              # (288,) float32
+        else:
+            fmri = grp["fmri"]   # (T, 96, 96, 96) or (n_roi, T)
+            n_fmri_frames = fmri.shape[0] if not self.config.use_parcellation else fmri.shape[1]
+            jitter = random.choice(self.config.fmri_aug.tr_jitter) if self.using_aug else 0
+            tr_idx = min(max(int(tr_idx) + jitter, 0), n_fmri_frames - 1)
+
+            fmri_start = tr_idx
+            fmri_end   = int(tr_idx + np.ceil(self.config.eeg_win_sec / self.config.tr))
+
+            if self.config.use_parcellation:
+                fmri_tr = fmri[:, fmri_start:fmri_end].astype(np.float32)   # (n_roi, T_win)
+            else:
+                fmri_tr = fmri[fmri_start:fmri_end]                         # (T_win, X, Y, Z) float16
+                fmri_tr = np.transpose(fmri_tr, (1, 2, 3, 0))               # (X, Y, Z, T_win) float16
 
         t_fmri = tr_idx * self.config.tr
         ts_eeg = t_fmri - np.array(self.config.hrf_shifts_sec)
-
-        fmri_start = tr_idx
-        fmri_end   = int(tr_idx + np.ceil(self.config.eeg_win_sec / self.config.tr))
-
-        if self.config.use_parcellation:
-            fmri_tr = fmri[:, fmri_start:fmri_end].astype(np.float32)   # (n_roi, T_win)
-        else:
-            fmri_tr = fmri[fmri_start:fmri_end].astype(np.float32)      # (T_win, X, Y, Z)
-            # downstream code (FmriAugmentor, NeuroSTORM) expects T as the last dim
-            fmri_tr = np.transpose(fmri_tr, (1, 2, 3, 0))                # (X, Y, Z, T_win)
 
         n_samples = int(self.config.eeg_win_sec * self.config.eeg_sr)
         n_ch      = eeg.shape[1]              # native channel count for this recording
@@ -185,8 +216,8 @@ class SimultEEG_fMRI(Dataset):
             eeg_windows.append(chunk)
 
         return {
-            "eeg":      torch.tensor(np.stack(eeg_windows)),  # (K, C_native, T)
-            "fmri":     torch.tensor(fmri_tr),                # (X, Y, Z, T_win) or (n_roi, T_win)
+            "eeg":      torch.from_numpy(np.stack(eeg_windows)),  # (K, C_native, T)
+            "fmri":     torch.from_numpy(fmri_tr),                # (X, Y, Z, T_win) or (n_roi, T_win)
             "ch_names": info["channels"],                     # list[str], len = C_native
             "tr_idx":   int(tr_idx),
             "sub":      meta["sub"],
