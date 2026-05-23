@@ -218,8 +218,9 @@ class FMRIEncoder1D(nn.Module):
     Input per TR: [B, n_roi] — treated as a flat feature vector, not a 1D signal.
     Using a plain MLP avoids imposing a false 1D spatial ordering on Schaefer ROIs.
     """
-    def __init__(self, n_roi: int = 200, hidden_dim: int = 512, embed_dim: int = 128, dropout: float = 0.4):
+    def __init__(self, config: TrainConfig, hidden_dim: int = 512, dropout: float = 0.4):
         super().__init__()
+        n_roi = config.model.n_roi
 
         self.net = nn.Sequential(
             nn.Linear(n_roi, hidden_dim),
@@ -231,7 +232,7 @@ class FMRIEncoder1D(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
-        self.proj = Projector(hidden_dim // 2, embed_dim)
+        self.proj = Projector(config, in_dim=hidden_dim // 2)
 
     def forward(self, x):
         """

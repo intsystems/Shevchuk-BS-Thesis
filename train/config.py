@@ -51,9 +51,9 @@ class DataConfig:
     fmri_aug: fmriAug = field(default_factory=fmriAug)
 
     #batch sampler settings:
-    num_timestamps: int = 8 #number of timesteps inside activity used in batch
-    num_subjects: int = 16 #number of subject per activity
-    margin_tr: int = 5 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation) 
+    num_timestamps: int = 32 #number of timesteps inside activity used in batch
+    num_subjects: int = 1 #number of subject per activity
+    margin_tr: int = 2 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation)
 
 @dataclass
 class ModelConfig:
@@ -85,7 +85,7 @@ class TrainingConfig:
     weight_decay: float = 0.0
     warmup_steps: int = 50
     num_epochs:int = 100
-    tau: float = 0.07 #for infonce loss
+    tau: float = 0.15 #for infonce loss
 
     freeze_backbone: bool = True
 
@@ -111,10 +111,10 @@ class TrainingConfig:
     # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same
     # batch every step; max_steps=-1 disables step limit (combine with num_epochs).
     overfit_batches: int = 0
-    max_steps: int = 10000
+    max_steps: int = 5000
 
     wandb_project: str = "shevchuk-bs-thesis"
-    wandb_group: str = "overfit-train"
+    wandb_group: str = "overfit-sanity"
 
     profile: bool = False  # run torch.profiler for a few steps then exit
 

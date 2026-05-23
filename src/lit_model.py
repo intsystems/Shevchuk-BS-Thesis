@@ -101,6 +101,12 @@ class ContrastiveModel(L.LightningModule):
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=self.config.train.grad_clip_val)
         self.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False)
 
+        curr_grads = torch.cat([p.grad.flatten() for p in trainable]).detach()
+        if hasattr(self, "_prev_grads"):
+            cos = F.cosine_similarity(curr_grads.unsqueeze(0), self._prev_grads.unsqueeze(0)).item()
+            self.log("train/grad_cos", cos, on_step=True, on_epoch=False)
+        self._prev_grads = curr_grads
+
         backbone_opt.step()
         projector_opt.step()
         backbone_sched.step()

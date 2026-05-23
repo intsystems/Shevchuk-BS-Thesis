@@ -45,7 +45,7 @@ class SimultEEG_fMRI(Dataset):
 
     def _build_pairs_and_index(self):
         win_trs     = int(np.ceil(self.config.eeg_win_sec / self.config.tr))
-        min_tr_off  = int(np.ceil(np.max(self.config.hrf_shifts_sec) / self.config.tr))
+        min_tr_off  = int(np.ceil((np.max(self.config.hrf_shifts_sec) + self.config.eeg_win_sec) / self.config.tr))
 
         with h5py.File(self.config.output_h5, 'r') as h5f:
             for sub_id in sorted(h5f.keys()):
@@ -85,11 +85,10 @@ class SimultEEG_fMRI(Dataset):
                     min_tr = min_tr_off
 
                     # max_tr is bounded by both fMRI and EEG length:
-                    # last EEG sample needed is (t_fmri - min(hrf_shifts) + eeg_win_sec) * eeg_sr
+                    # last EEG sample needed is (t_fmri - min(hrf_shifts)) * eeg_sr
                     max_tr_fmri = n_tr - win_trs
                     max_t_fmri  = (eeg.shape[0] / self.config.eeg_sr
-                                   + min(self.config.hrf_shifts_sec)
-                                   - self.config.eeg_win_sec)
+                                   + min(self.config.hrf_shifts_sec))
                     max_tr_eeg  = int(max_t_fmri / self.config.tr)
                     max_tr      = min(max_tr_fmri, max_tr_eeg)
 
@@ -182,7 +181,7 @@ class SimultEEG_fMRI(Dataset):
                 fmri_tr = np.transpose(fmri_tr, (1, 2, 3, 0))               # (X, Y, Z, T_win) float16
 
         t_fmri = tr_idx * self.config.tr
-        ts_eeg = t_fmri - np.array(self.config.hrf_shifts_sec)
+        ts_eeg = t_fmri - np.array(self.config.hrf_shifts_sec) - self.config.eeg_win_sec
 
         n_samples = int(self.config.eeg_win_sec * self.config.eeg_sr)
         n_ch      = eeg.shape[1]              # native channel count for this recording

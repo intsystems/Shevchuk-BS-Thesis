@@ -93,10 +93,7 @@ def build_loaders(config: TrainConfig):
 def build_model(config: TrainConfig):
     eeg_encoder = EEGEncoder(config)
     if config.data.use_parcellation:
-        fmri_encoder = FMRIEncoder1D(
-            n_roi=config.model.n_roi,
-            embed_dim=config.model.projector_out_dim,
-        )
+        fmri_encoder = FMRIEncoder1D(config)
     else:
         fmri_encoder = FMRIEncoderVolume(config)
 
