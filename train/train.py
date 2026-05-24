@@ -69,12 +69,9 @@ def build_loaders(config: TrainConfig):
         val_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
-        num_workers=nw,
+        num_workers=0,
         collate_fn=collate_fn,
         pin_memory=False,
-        prefetch_factor=1 if nw > 0 else None,
-        persistent_workers=nw > 0,
-        multiprocessing_context=ctx,
     )
     test_loader = DataLoader(
         test_ds,
@@ -180,6 +177,9 @@ def main():
         return
 
     train_loader, val_loader, test_loader = build_loaders(config)
+
+    print(f"[DATA] train_ds={len(train_loader.dataset)} val_ds={len(val_loader.dataset)} test_ds={len(test_loader.dataset)}", flush=True)
+    print(f"[DATA] train_loader={len(train_loader)} val_loader={len(val_loader)} test_loader={len(test_loader)}", flush=True)
 
     # overfit_batches=N doesn't cache — it re-reads from HDF5 and re-transfers
     # CPU→GPU every step. Pre-load once and park the batch on GPU so the

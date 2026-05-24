@@ -146,7 +146,14 @@ class ContrastiveModel(L.LightningModule):
 
         return loss
 
+    def on_validation_epoch_start(self):
+        with open("val_debug.log", "a") as f:
+            f.write(f"START step={self.global_step}\n")
+
     def validation_step(self, batch, batch_idx):
+        with open("val_debug.log", "a") as f:
+            f.write(f"  step {batch_idx} eeg={tuple(batch['eeg'].shape)}\n")
+
         eeg_pred  = self._encode_eeg(batch["eeg"], ch_names=batch.get("ch_names"))
         fmri_pred = self.fmri_encoder(batch["fmri"])
         # store on CPU to avoid filling GPU memory during long val epochs
@@ -154,6 +161,8 @@ class ContrastiveModel(L.LightningModule):
         self._val_fmri.append(fmri_pred.detach())
 
     def on_validation_epoch_end(self):
+        with open("val_debug.log", "a") as f:
+            f.write(f"END accumulated={len(self._val_eeg)}\n")
         if not self._val_eeg:
             return
 
