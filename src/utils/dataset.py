@@ -236,7 +236,9 @@ def collate_fn(batch):
     The returned 'ch_names' is the per-batch channel list (Python list of strings)
     that the encoder uses to build LaBraM's input_chans positional-embedding indices.
     """
-    batch = sorted(batch, key=lambda x: (x["tr_idx"], x["sub"]))
+    # Group by (run, tr) so the K samples sharing one slot stay contiguous
+    # in the flattened batch — the contrastive loss reshape expects this.
+    batch = sorted(batch, key=lambda x: (x["run"], x["tr_idx"], x["sub"]))
 
     # 1. intersection of channels across the batch
     common = set(batch[0]["ch_names"])
@@ -271,51 +273,78 @@ def collate_fn(batch):
 
 
 class ContrastiveBatchSampler(Sampler):
+    """
+    Yields batches of M*K dataset indices, structured as M "slots" of K subjects.
+    Each slot = one (run, tr); the K samples in a slot share that (run, tr) and
+    differ only in subject.
+
+    Slots within a batch are drawn ACROSS recordings rather than all from a single
+    one. Without cross-recording mixing, every positive pair in a batch also shares
+    subject/activity-level confounds (head motion, electrode placement, baseline
+    BOLD scale), and the contrastive task degenerates to "tell apart M timestamps
+    from this one recording" — solvable via batch-local cues that don't transfer.
+
+    The `margin_tr` constraint still applies, but only between two slots from the
+    SAME recording within the same batch. Two slots from different recordings are
+    unconstrained: their fMRI signals are anatomically/temporally unrelated
+    regardless of TR index, so no decorrelation is needed.
+    """
     def __init__(self, dataset: SimultEEG_fMRI, config: TrainConfig):
         self.dataset = dataset
-        self.M      = config.data.num_timestamps
-        self.K      = config.data.num_subjects
-        self.margin = config.data.margin_tr
+        self.M       = config.data.num_timestamps
+        self.K       = config.data.num_subjects
+        self.margin  = config.data.margin_tr
 
-        self.run_tr_indices = defaultdict(lambda: defaultdict(list))
+        # run -> tr -> list of dataset indices (one entry per subject that has this (run, tr))
+        run_tr_indices: dict = defaultdict(lambda: defaultdict(list))
         for idx, meta in enumerate(self.dataset.meta):
-            self.run_tr_indices[meta['run']][meta['tr']].append(idx)
+            run_tr_indices[meta['run']][meta['tr']].append(idx)
+        self.run_tr_indices = run_tr_indices
+
+        # flat pool of (run, tr) slots that have ≥ K subjects available
+        self.usable_slots = [
+            (run, tr)
+            for run, tr_dict in self.run_tr_indices.items()
+            for tr, subs in tr_dict.items()
+            if len(subs) >= self.K
+        ]
 
     def __iter__(self):
-        runs = list(self.run_tr_indices.keys())
-        random.shuffle(runs)
+        n = len(self.usable_slots)
+        order = list(range(n))
+        random.shuffle(order)
 
-        for run in runs:
-            # only TRs with ≥ K subjects are usable — guarantees fixed batch shape (M, K)
-            available_trs = [tr for tr, subjs in self.run_tr_indices[run].items()
-                             if len(subjs) >= self.K]
-            random.shuffle(available_trs)
+        pos = 0
+        while pos < n:
+            batch_slots = []
+            used_per_run: dict = defaultdict(list)
 
-            while available_trs:
-                selected_trs = []
-                for tr in available_trs:
-                    if all(abs(tr - s) >= self.margin for s in selected_trs):
-                        selected_trs.append(tr)
-                    if len(selected_trs) == self.M:
-                        break
+            # Scan forward through the shuffled remainder, accepting slots that
+            # satisfy per-recording margin against the in-progress batch. Accepted
+            # indices are swapped into the [pos:next_pos] prefix so the same slot
+            # is not reused in subsequent batches within this epoch.
+            i = pos
+            next_pos = pos
+            while i < n and len(batch_slots) < self.M:
+                run, tr = self.usable_slots[order[i]]
+                if all(abs(tr - t) >= self.margin for t in used_per_run[run]):
+                    batch_slots.append((run, tr))
+                    used_per_run[run].append(tr)
+                    order[next_pos], order[i] = order[i], order[next_pos]
+                    next_pos += 1
+                i += 1
 
-                if len(selected_trs) < self.M:
-                    break
+            if len(batch_slots) < self.M:
+                return  # tail of epoch — cannot fill another full batch
 
-                for tr in selected_trs:
-                    available_trs.remove(tr)
+            pos = next_pos
 
-                batch_indices = []
-                for tr in selected_trs:
-                    subjs = self.run_tr_indices[run][tr]
-                    sampled = random.sample(subjs, self.K)
-                    batch_indices.extend(sampled)
-
-                yield batch_indices
+            batch_indices = []
+            for run, tr in batch_slots:
+                subjs = self.run_tr_indices[run][tr]
+                sampled = random.sample(subjs, self.K)
+                batch_indices.extend(sampled)
+            yield batch_indices
 
     def __len__(self):
-        total = 0
-        for run, tr_dict in self.run_tr_indices.items():
-            span = max(tr_dict.keys()) - min(tr_dict.keys())
-            total += (span // self.margin) // self.M
-        return total
+        return len(self.usable_slots) // self.M
