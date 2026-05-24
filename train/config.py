@@ -50,10 +50,11 @@ class DataConfig:
     eeg_aug: eegAug = field(default_factory=eegAug)
     fmri_aug: fmriAug = field(default_factory=fmriAug)
 
-    #batch sampler settings:
-    num_timestamps: int = 32 #number of timesteps inside activity used in batch
-    num_subjects: int = 1 #number of subject per activity
-    margin_tr: int = 2 #minimal number of fmri frames between two neighbouring timesteps (to cancel high time correlation)
+    #batch sampler settings (hierarchical R x T):
+    num_timestamps: int = 8 #T: TRs sampled from each recording per batch
+    num_recordings: int = 8 #R: distinct recordings per batch. Total slots per batch = R * T; forces same-recording hard negatives so the model cannot solve contrastive matching via subject identity alone.
+    num_subjects: int = 1 #K: subjects per (rec, tr) slot (multi-positive count)
+    margin_tr: int = 2 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
 @dataclass
 class ModelConfig:
@@ -85,15 +86,15 @@ class TrainingConfig:
     weight_decay: float = 0.0
     warmup_steps: int = 50
     num_epochs:int = 100
-    tau: float = 0.15 #for infonce loss
+    tau: float = 0.07 #for infonce loss
 
     freeze_backbone: bool = True
 
     #lora params
     eeg_lora_rank: int = 64
-    eeg_lora_alpha: float = 32
+    eeg_lora_alpha: float = 128
     fmri_lora_rank: int = 128
-    fmri_lora_alpha: float = 64
+    fmri_lora_alpha: float = 256
     lora_dropout: float = 0.0
 
     #data
