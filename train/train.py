@@ -227,6 +227,11 @@ def main():
         config=asdict(config),
     )
 
+    # Use a fixed batch interval for validation so it triggers independently of
+    # epoch boundaries — the R x T sampler may yield fewer batches than __len__
+    # reports, which can confuse Lightning's epoch-end val scheduling.
+    val_every = max(1, int(0.5 * len(train_loader))) if not config.train.overfit_batches else 10**9
+
     trainer = L.Trainer(
         max_epochs=-1,
         max_steps=config.train.max_steps,
@@ -238,9 +243,11 @@ def main():
         logger=logger,
         log_every_n_steps=1 if config.train.overfit_batches else 10,
         num_sanity_val_steps=0 if config.train.overfit_batches else 2,
-        check_val_every_n_epoch=10**9 if config.train.overfit_batches else 1,
+        val_check_interval=val_every,
+        check_val_every_n_epoch=None,
         gradient_clip_val=None,  # manual optimization → clipping done in training_step via clip_grad_norm_
     )
+    print(f"[TRAIN] val_check_interval={val_every} batches", flush=True)
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     if not config.train.overfit_batches:
