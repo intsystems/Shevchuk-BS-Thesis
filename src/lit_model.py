@@ -73,7 +73,14 @@ class ContrastiveModel(L.LightningModule):
         if not self.training or not self.config.train.using_aug:
             return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names}
 
-        eeg_aug  = self.eeg_augmentor(eeg)
+        # EEGAugmentor expects (B, C, T). For multi-HRF input (B, K_hrf, C, T)
+        # fold K_hrf into batch so each shift is independently augmented, then
+        # restore the original layout.
+        if eeg.dim() == 4:
+            B, K_hrf, C, T = eeg.shape
+            eeg_aug = self.eeg_augmentor(eeg.reshape(B * K_hrf, C, T)).reshape(B, K_hrf, C, T)
+        else:
+            eeg_aug = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
         return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names}
 
