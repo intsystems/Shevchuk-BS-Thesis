@@ -69,9 +69,12 @@ def build_loaders(config: TrainConfig):
         val_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=nw,
         collate_fn=collate_fn,
         pin_memory=False,
+        prefetch_factor=1 if nw > 0 else None,
+        persistent_workers=nw > 0,
+        multiprocessing_context=ctx,
     )
     test_loader = DataLoader(
         test_ds,
@@ -230,7 +233,7 @@ def main():
     # Use a fixed batch interval for validation so it triggers independently of
     # epoch boundaries — the R x T sampler may yield fewer batches than __len__
     # reports, which can confuse Lightning's epoch-end val scheduling.
-    val_every = max(1, len(train_loader)) if not config.train.overfit_batches else 10**9
+    val_every = max(100, len(train_loader)) if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,

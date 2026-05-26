@@ -82,7 +82,10 @@ class TrainingConfig:
     #training params
     batch_size: int = 64
     backbone_lr: float = 2e-4
+
     proj_lr: float = 2e-3
+    proj_dropout: float = 0.2
+
     weight_decay: float = 0.0
     warmup_steps: int = 50
     num_epochs:int = 100
