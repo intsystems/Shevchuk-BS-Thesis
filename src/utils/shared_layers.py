@@ -10,10 +10,10 @@ class Projector(nn.Module):
         out    = config.model.projector_out_dim
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.GELU(),
             nn.Linear(hidden, out),
-            nn.BatchNorm1d(out),
+            nn.LayerNorm(out),
         )
 
     def forward(self, x):

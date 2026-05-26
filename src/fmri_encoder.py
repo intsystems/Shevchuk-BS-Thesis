@@ -224,11 +224,11 @@ class FMRIEncoder1D(nn.Module):
 
         self.net = nn.Sequential(
             nn.Linear(n_roi, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
