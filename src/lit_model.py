@@ -54,7 +54,7 @@ class ContrastiveModel(L.LightningModule):
         self.fmri_augmentor = FmriAugmentor(config)
 
         # buffers for accumulating val embeddings across batches
-        self._val_eeg, self._val_fmri = [], []
+        self._val_eeg, self._val_fmri, self._val_subs = [], [], []
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor):
         x2 = x2.unsqueeze(1) #shape will be (B, 1, X, Y, Z, T)
@@ -74,6 +74,7 @@ class ContrastiveModel(L.LightningModule):
     def on_after_batch_transfer(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
         ch_names  = batch.get("ch_names")   # carried through as Python list (collate keeps it)
+        sub       = batch.get("sub")        # list[str] of subject IDs, length B
 
         # fMRI is kept as float16 through CPU/worker pipeline to halve memory; cast here on GPU.
         fmri = fmri.float()
@@ -83,7 +84,7 @@ class ContrastiveModel(L.LightningModule):
             eeg = eeg.squeeze(1)
 
         if not self.training or not self.config.train.using_aug:
-            return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names}
+            return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names, "sub": sub}
 
         # EEGAugmentor expects (B, C, T). For multi-HRF input (B, K_hrf, C, T)
         # fold K_hrf into batch so each shift is independently augmented, then
@@ -94,7 +95,7 @@ class ContrastiveModel(L.LightningModule):
         else:
             eeg_aug = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
-        return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names}
+        return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names, "sub": sub}
 
     def training_step(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
@@ -165,6 +166,23 @@ class ContrastiveModel(L.LightningModule):
             self.log("train/sim_neg", sim_neg)
             self.log("train/sim_gap", sim_pos - sim_neg, prog_bar=True)
 
+            # subject-identity diagnostic: split negatives into same-subject vs cross-subject
+            subs = batch.get("sub")
+            if subs is not None:
+                sub_ids = torch.tensor(
+                    [hash(s) & 0x7FFF_FFFF for s in subs], device=sim.device
+                )
+                same_sub  = sub_ids.unsqueeze(0) == sub_ids.unsqueeze(1)   # [B, B]
+                neg_same  = ~mask_pos &  same_sub
+                neg_cross = ~mask_pos & ~same_sub
+                if neg_same.any():
+                    self.log("train/sim_neg_same_sub",  sim[neg_same].mean(), on_step=True)
+                if neg_cross.any():
+                    self.log("train/sim_neg_diff_sub",  sim[neg_cross].mean(), on_step=True)
+                if neg_same.any() and neg_cross.any():
+                    self.log("train/sim_neg_id_gap",
+                             sim[neg_same].mean() - sim[neg_cross].mean(), on_step=True)
+
         return loss
 
     def on_validation_epoch_start(self):
@@ -180,6 +198,8 @@ class ContrastiveModel(L.LightningModule):
         # store on CPU to avoid filling GPU memory during long val epochs
         self._val_eeg.append(eeg_pred.detach())
         self._val_fmri.append(fmri_pred.detach())
+        if batch.get("sub") is not None:
+            self._val_subs.extend(batch["sub"])
 
     def on_validation_epoch_end(self):
         with open("val_debug.log", "a") as f:
@@ -189,8 +209,10 @@ class ContrastiveModel(L.LightningModule):
 
         z_e = torch.cat(self._val_eeg, dim=0).float()   # [B, D]
         z_f = torch.cat(self._val_fmri, dim=0).float()
+        val_subs = list(self._val_subs)
         self._val_eeg.clear()
         self._val_fmri.clear()
+        self._val_subs.clear()
 
         z_en = F.normalize(z_e, dim=-1)
         z_fn = F.normalize(z_f, dim=-1)
@@ -215,6 +237,28 @@ class ContrastiveModel(L.LightningModule):
 
         self.log("val/mrr_f2e", (1.0 / rank).mean())
         self.log("val/mrr_e2f", (1.0 / rank_T).mean(), prog_bar=True)
+
+        # subject identity decoding — nearest-centroid probe on val embeddings.
+        # If accuracy >> 1/n_subjects, the embeddings encode who, not what.
+        if len(val_subs) == z_e.shape[0] and len(set(val_subs)) >= 2:
+            unique_subs = sorted(set(val_subs))
+            n_subs = len(unique_subs)
+            sub2idx = {s: i for i, s in enumerate(unique_subs)}
+            labels  = torch.tensor([sub2idx[s] for s in val_subs], device=z_en.device)
+
+            def _nearest_centroid_acc(z):
+                centroids = torch.zeros(n_subs, z.shape[1], device=z.device)
+                for i in range(n_subs):
+                    mask = labels == i
+                    if mask.any():
+                        centroids[i] = z[mask].mean(0)
+                centroids = F.normalize(centroids, dim=-1)
+                preds = (z @ centroids.T).argmax(dim=1)
+                return (preds == labels).float().mean()
+
+            self.log("val/sub_decode_eeg",  _nearest_centroid_acc(z_en))
+            self.log("val/sub_decode_fmri", _nearest_centroid_acc(z_fn))
+            self.log("val/sub_chance",      torch.tensor(1.0 / n_subs))
         
     def configure_optimizers(self):
         backbone_params, projector_params = [], []

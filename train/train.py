@@ -4,9 +4,10 @@ import random
 from dataclasses import asdict
 from pathlib import Path
 
+import datetime
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger, CSVLogger
 from torch.utils.data import DataLoader
 
 from src.eeg_encoder import EEGEncoder
@@ -223,17 +224,22 @@ def main():
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
-    logger = WandbLogger(
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_logger = CSVLogger(save_dir="logs/runs", name=run_id, version="")
+
+    wandb_logger = WandbLogger(
         project=config.train.wandb_project,
         group=config.train.wandb_group,
         save_dir="logs",
         config=asdict(config),
     )
+    logger = [wandb_logger, csv_logger]
+    print(f"[LOG] local metrics → logs/runs/{run_id}/metrics.csv", flush=True)
 
     # Use a fixed batch interval for validation so it triggers independently of
     # epoch boundaries — the R x T sampler may yield fewer batches than __len__
     # reports, which can confuse Lightning's epoch-end val scheduling.
-    val_every = max(100, len(train_loader)) if not config.train.overfit_batches else 10**9
+    val_every = max(50, len(train_loader)) if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,

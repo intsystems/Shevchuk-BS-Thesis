@@ -269,6 +269,7 @@ def collate_fn(batch):
         "eeg":      torch.stack(eeg_tensors),
         "fmri":     torch.stack(fmri_tensors),
         "ch_names": common_ordered,
+        "sub":      [s["sub"] for s in batch],   # list[str], length B — for subject-identity diagnostics
     }
 
 

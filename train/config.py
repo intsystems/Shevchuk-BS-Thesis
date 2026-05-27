@@ -10,7 +10,7 @@ class fmriAug:
     tr_jitter: tuple = (-1, 0, 1) 
 @dataclass
 class eegAug:
-    sigma: float = 1 #std for applying gaussian noise and pink noise
+    sigma: float = 0.05 #std for applying gaussian noise and pink noise (EEG is z-normalized → std≈1, so sigma<<1 keeps SNR reasonable)
     max_time_shift: int = 1  #int number of frames to shift by
     channel_drop_prob: float = 0.2 #float in [0,1]
     ratio_of_freq_to_drop: float = 0.2 #float in [0,1]
@@ -111,7 +111,7 @@ class TrainingConfig:
     num_workers: int = 6
     save_every:int = 5
 
-    using_aug: bool = False
+    using_aug: bool = True
     grad_clip_val: float = 1.0
 
     # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same
