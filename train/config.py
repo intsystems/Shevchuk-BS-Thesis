@@ -53,7 +53,7 @@ class DataConfig:
     #batch sampler settings (hierarchical R x T):
     num_timestamps: int = 8 #T: TRs sampled from each recording per batch
     num_recordings: int = 8 #R: distinct recordings per batch. Total slots per batch = R * T; forces same-recording hard negatives so the model cannot solve contrastive matching via subject identity alone.
-    num_subjects: int = 1 #K: subjects per (rec, tr) slot (multi-positive count)
+    num_subjects: int = 2 #K: subjects per (rec, tr) slot (multi-positive count)
     margin_tr: int = 2 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
 @dataclass
@@ -84,9 +84,11 @@ class TrainingConfig:
     backbone_lr: float = 2e-4
 
     proj_lr: float = 2e-3
-    proj_dropout: float = 0.2
+    proj_dropout: float = 0.1
 
     weight_decay: float = 0.0
+
+    scheduler: str = "warmup_cosine"
     warmup_steps: int = 50
     num_epochs:int = 100
     tau: float = 0.07 #for infonce loss
@@ -94,10 +96,10 @@ class TrainingConfig:
     freeze_backbone: bool = True
 
     #lora params
-    eeg_lora_rank: int = 64
-    eeg_lora_alpha: float = 128
-    fmri_lora_rank: int = 128
-    fmri_lora_alpha: float = 256
+    eeg_lora_rank: int = 16
+    eeg_lora_alpha: float = 16
+    fmri_lora_rank: int = 16
+    fmri_lora_alpha: float = 16
     lora_dropout: float = 0.0
 
     #data
@@ -106,7 +108,7 @@ class TrainingConfig:
     test_ratio: float = 0.1
     
     seed: int = 42
-    num_workers: int = 8
+    num_workers: int = 6
     save_every:int = 5
 
     using_aug: bool = False
@@ -118,7 +120,7 @@ class TrainingConfig:
     max_steps: int = 5000
 
     wandb_project: str = "shevchuk-bs-thesis"
-    wandb_group: str = "overfit-sanity"
+    wandb_group: str = "trying-baseline"
 
     profile: bool = False  # run torch.profiler for a few steps then exit
 

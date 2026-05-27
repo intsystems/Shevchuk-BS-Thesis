@@ -19,7 +19,7 @@ class ContrastiveModel(L.LightningModule):
         eeg_lora = LoraConfig(
             r=config.train.eeg_lora_rank,
             lora_alpha=config.train.eeg_lora_alpha,
-            target_modules=["qkv"],
+            target_modules=["proj"],   # "qkv" is bypassed via F.linear(weight=.weight); "proj" is called normally
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
@@ -27,7 +27,10 @@ class ContrastiveModel(L.LightningModule):
         fmri_lora = LoraConfig(
             r=config.train.fmri_lora_rank,
             lora_alpha=config.train.fmri_lora_alpha,
-            target_modules=["in_proj", "out_proj", "x_proj", "dt_proj"],
+            # NeuroSTORM backbone is pure Mamba; Mamba projections (in_proj/out_proj/etc.)
+            # use a CUDA fast path that accesses .weight directly, bypassing the LoRA wrapper.
+            # mlp.linear1/linear2 are standard PyTorch Linear called normally via MLPBlock.forward.
+            target_modules=["linear1", "linear2"],
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
@@ -37,6 +40,15 @@ class ContrastiveModel(L.LightningModule):
 
         self.eeg_encoder  = get_peft_model(self.eeg_encoder, eeg_lora)
         self.fmri_encoder = get_peft_model(self.fmri_encoder, fmri_lora)
+
+        def _param_breakdown(label, peft_model):
+            lora  = sum(p.numel() for n, p in peft_model.named_parameters() if "lora_A" in n or "lora_B" in n)
+            proj  = sum(p.numel() for n, p in peft_model.named_parameters() if "projector" in n and p.requires_grad)
+            total = sum(p.numel() for p in peft_model.parameters())
+            print(f"[{label}]  LoRA={lora:,}  projector={proj:,}  total_trainable={lora+proj:,}  frozen={total-lora-proj:,}")
+
+        _param_breakdown("EEG ", self.eeg_encoder)
+        _param_breakdown("fMRI", self.fmri_encoder)
 
         self.eeg_augmentor = EEGAugmentor(config)
         self.fmri_augmentor = FmriAugmentor(config)
@@ -104,9 +116,18 @@ class ContrastiveModel(L.LightningModule):
         projector_opt.zero_grad()
         self.manual_backward(loss)
 
+        lora_grads = [p.grad for n, p in self.named_parameters() if "projector" not in n and p.requires_grad and p.grad is not None]
+        proj_grads = [p.grad for n, p in self.named_parameters() if "projector" in n and p.requires_grad and p.grad is not None]
+        lora_norm = torch.stack([g.norm(2) for g in lora_grads]).norm(2) if lora_grads else torch.zeros(1, device=self.device)
+        proj_norm = torch.stack([g.norm(2) for g in proj_grads]).norm(2) if proj_grads else torch.zeros(1, device=self.device)
+
         trainable = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=self.config.train.grad_clip_val)
         self.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False)
+        self.log("train/lora_grad_norm", lora_norm, on_step=True, on_epoch=False)
+        self.log("train/proj_grad_norm", proj_norm, on_step=True, on_epoch=False)
+        if proj_norm > 0:
+            self.log("train/lora_proj_grad_ratio", lora_norm / proj_norm, on_step=True, on_epoch=False)
 
         curr_grads = torch.cat([p.grad.flatten() for p in trainable]).detach()
         if hasattr(self, "_prev_grads"):
@@ -216,17 +237,22 @@ class ContrastiveModel(L.LightningModule):
             weight_decay=self.config.train.weight_decay,
         )
         def make_scheduler(opt):
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                opt, start_factor=0.1, end_factor=1.0,
-                total_iters=self.config.train.warmup_steps,
-            )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
-            )
-            return torch.optim.lr_scheduler.SequentialLR(
-                opt, schedulers=[warmup, cosine],
-                milestones=[self.config.train.warmup_steps],
-            )
+            if self.config.train.scheduler == "warmup_cosine":
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=0.1, end_factor=1.0,
+                    total_iters=self.config.train.warmup_steps,
+                )
+                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
+                )
+                return torch.optim.lr_scheduler.SequentialLR(
+                    opt, schedulers=[warmup, cosine],
+                    milestones=[self.config.train.warmup_steps],
+                )
+            elif self.config.train.scheduler == "const":
+                return torch.optim.lr_scheduler.LinearLR(opt,
+                start_factor=1,
+                end_factor=1)
 
         return (
             [backbone_opt, projector_opt],

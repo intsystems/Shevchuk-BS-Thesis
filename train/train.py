@@ -97,10 +97,10 @@ def build_model(config: TrainConfig):
     else:
         fmri_encoder = FMRIEncoderVolume(config)
 
-    print(f"[EEG]  total/trainable: {count_params(eeg_encoder)}")
-    print(f"[fMRI] total/trainable: {count_params(fmri_encoder)}")
-
-    return ContrastiveModel(eeg_encoder, fmri_encoder, config)
+    model = ContrastiveModel(eeg_encoder, fmri_encoder, config)
+    print(f"[EEG]  total/trainable: {count_params(model.eeg_encoder)}")
+    print(f"[fMRI] total/trainable: {count_params(model.fmri_encoder)}")
+    return model
 
 
 def profile_run(config: TrainConfig, n_steps: int = 8):
