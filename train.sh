@@ -17,5 +17,7 @@ export LD_LIBRARY_PATH=\
 "$VENV_NVIDIA/nccl/lib:"\
 "${LD_LIBRARY_PATH:-}"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 source "$SCRIPT_DIR/.venv/bin/activate"
 exec python3 -m train.train "$@"

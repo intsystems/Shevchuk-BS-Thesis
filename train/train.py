@@ -4,9 +4,10 @@ import random
 from dataclasses import asdict
 from pathlib import Path
 
+import datetime
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger, CSVLogger
 from torch.utils.data import DataLoader
 
 from src.eeg_encoder import EEGEncoder
@@ -128,10 +129,10 @@ def build_model(config: TrainConfig):
     else:
         fmri_encoder = FMRIEncoderVolume(config)
 
-    print(f"[EEG]  total/trainable: {count_params(eeg_encoder)}")
-    print(f"[fMRI] total/trainable: {count_params(fmri_encoder)}")
-
-    return ContrastiveModel(eeg_encoder, fmri_encoder, config)
+    model = ContrastiveModel(eeg_encoder, fmri_encoder, config)
+    print(f"[EEG]  total/trainable: {count_params(model.eeg_encoder)}")
+    print(f"[fMRI] total/trainable: {count_params(model.fmri_encoder)}")
+    return model
 
 
 def profile_run(config: TrainConfig, n_steps: int = 8):
@@ -254,19 +255,28 @@ def main():
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
+<<<<<<< HEAD
     run_name = f"fold-{config.train.cv_fold}" if config.train.n_folds > 1 else None
     logger = WandbLogger(
+=======
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_logger = CSVLogger(save_dir="logs/runs", name=run_id, version="")
+
+    wandb_logger = WandbLogger(
+>>>>>>> d17972e8caa7dd5086e4b60f90f31f47667c98a1
         project=config.train.wandb_project,
         group=config.train.wandb_group,
         name=run_name,
         save_dir="logs",
         config=asdict(config),
     )
+    logger = [wandb_logger, csv_logger]
+    print(f"[LOG] local metrics → logs/runs/{run_id}/metrics.csv", flush=True)
 
     # Use a fixed batch interval for validation so it triggers independently of
     # epoch boundaries — the R x T sampler may yield fewer batches than __len__
     # reports, which can confuse Lightning's epoch-end val scheduling.
-    val_every = max(100, len(train_loader)) if not config.train.overfit_batches else 10**9
+    val_every = max(50, len(train_loader)) if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,

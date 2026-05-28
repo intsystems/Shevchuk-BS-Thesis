@@ -176,6 +176,7 @@ class FMRIEncoderVolume(nn.Module):
 
     def __init__(self, config: TrainConfig):
         super().__init__()
+        self.freeze_backbone = config.train.freeze_backbone
         self.backbone = _load_neurostorm_backbone(config.model.Neurostorm_ckpt, freeze=config.train.freeze_backbone)
         self.projector = FMRIProjectionHead(config)
 
@@ -192,8 +193,7 @@ class FMRIEncoderVolume(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Keep backbone in eval mode when frozen so BN/dropout behave correctly
-        if all(not p.requires_grad for p in self.backbone.parameters()):
+        if self.freeze_backbone:
             self.backbone.eval()
         return self
 

@@ -4,7 +4,7 @@ set -e
 echo "=== 1. Клонирование репозитория и весов ==="
 rm -rf NeuroSTORM
 git clone --recursive https://github.com/CUHK-AIM-Group/NeuroSTORM.git
-wget -O neurostorm.ckpt "https://huggingface.co/zxcvb20001/NeuroSTORM/resolve/main/pretraining/pt_neurostorm_mae_ratio0.5.ckpt?download=true"
+wget -O neurostorm.ckpt "https://huggingface.co/zxcvb20001/NeuroSTORM/resolve/main/pretraining/pt_neurostorm_mae_5ds.ckpt?download=true"
 
 echo "=== 2. Создание venv с наследованием ЗАВОДСКОГО PyTorch ==="
 # Мы забираем идеальный, протестированный Google/NVIDIA торч из системы

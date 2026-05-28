@@ -10,7 +10,7 @@ class fmriAug:
     tr_jitter: tuple = (-1, 0, 1) 
 @dataclass
 class eegAug:
-    sigma: float = 1 #std for applying gaussian noise and pink noise
+    sigma: float = 0.05 #std for applying gaussian noise and pink noise (EEG is z-normalized → std≈1, so sigma<<1 keeps SNR reasonable)
     max_time_shift: int = 1  #int number of frames to shift by
     channel_drop_prob: float = 0.2 #float in [0,1]
     ratio_of_freq_to_drop: float = 0.2 #float in [0,1]
@@ -53,7 +53,7 @@ class DataConfig:
     #batch sampler settings (hierarchical R x T):
     num_timestamps: int = 8 #T: TRs sampled from each recording per batch
     num_recordings: int = 8 #R: distinct recordings per batch. Total slots per batch = R * T; forces same-recording hard negatives so the model cannot solve contrastive matching via subject identity alone.
-    num_subjects: int = 1 #K: subjects per (rec, tr) slot (multi-positive count)
+    num_subjects: int = 2 #K: subjects per (rec, tr) slot (multi-positive count)
     margin_tr: int = 2 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
 @dataclass
@@ -84,9 +84,11 @@ class TrainingConfig:
     backbone_lr: float = 2e-4
 
     proj_lr: float = 2e-3
-    proj_dropout: float = 0.2
+    proj_dropout: float = 0.1
 
     weight_decay: float = 0.0
+
+    scheduler: str = "warmup_cosine"
     warmup_steps: int = 50
     num_epochs:int = 100
     tau: float = 0.07 #for infonce loss
@@ -100,10 +102,10 @@ class TrainingConfig:
     freeze_backbone: bool = True
 
     #lora params
-    eeg_lora_rank: int = 64
-    eeg_lora_alpha: float = 128
-    fmri_lora_rank: int = 128
-    fmri_lora_alpha: float = 256
+    eeg_lora_rank: int = 16
+    eeg_lora_alpha: float = 16
+    fmri_lora_rank: int = 16
+    fmri_lora_alpha: float = 16
     lora_dropout: float = 0.0
 
     #data
@@ -119,10 +121,10 @@ class TrainingConfig:
     cv_fold: int = 0
     
     seed: int = 42
-    num_workers: int = 8
+    num_workers: int = 6
     save_every:int = 5
 
-    using_aug: bool = False
+    using_aug: bool = True
     grad_clip_val: float = 1.0
 
     # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same

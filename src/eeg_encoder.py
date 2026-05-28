@@ -123,6 +123,7 @@ class EEGEncoder(nn.Module):
     def __init__(self, config: TrainConfig):
         super().__init__()
         self.ch_names = config.data.ch_names
+        self.freeze_backbone = config.train.freeze_backbone
         n_chans = len(self.ch_names)
 
         if config.model.labram_pretrained:
@@ -169,14 +170,23 @@ class EEGEncoder(nn.Module):
         if ch_names is None:
             ch_names = self.ch_names
         input_chans = self._build_input_chans(ch_names, x.device)
-        cls = self.backbone.forward_features(x, input_chans=input_chans)
+        if self.training:
+            from torch.utils.checkpoint import checkpoint
+            # Recompute activations during backward instead of caching them.
+            # Labram has 12 blocks each producing ~415 MB attention matrices in bf16;
+            # storing all of them for backprop exceeds GPU budget at batch 32.
+            cls = checkpoint(
+                lambda x_: self.backbone.forward_features(x_, input_chans=input_chans),
+                x, use_reentrant=False,
+            )
+        else:
+            cls = self.backbone.forward_features(x, input_chans=input_chans)
         if cls.dim() == 3:                # safety: (B, num_tokens, D) → take CLS
             cls = cls[:, 0]
         return self.projector(cls)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Keep backbone in eval mode when frozen so dropout/BN behave correctly
-        if all(not p.requires_grad for p in self.backbone.parameters()):
+        if self.freeze_backbone:
             self.backbone.eval()
         return self

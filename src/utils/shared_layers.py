@@ -12,7 +12,7 @@ class Projector(nn.Module):
             nn.Linear(in_dim, hidden),
             nn.BatchNorm1d(hidden),
             nn.GELU(),
-            nn.Dropout(config.train.proj_dropout)
+            nn.Dropout(config.train.proj_dropout),
             nn.Linear(hidden, out),
             nn.BatchNorm1d(out, track_running_stats=False)
         )

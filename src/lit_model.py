@@ -19,7 +19,7 @@ class ContrastiveModel(L.LightningModule):
         eeg_lora = LoraConfig(
             r=config.train.eeg_lora_rank,
             lora_alpha=config.train.eeg_lora_alpha,
-            target_modules=["qkv"],
+            target_modules=["proj"],   # "qkv" is bypassed via F.linear(weight=.weight); "proj" is called normally
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
@@ -27,7 +27,10 @@ class ContrastiveModel(L.LightningModule):
         fmri_lora = LoraConfig(
             r=config.train.fmri_lora_rank,
             lora_alpha=config.train.fmri_lora_alpha,
-            target_modules=["in_proj", "out_proj", "x_proj", "dt_proj"],
+            # NeuroSTORM backbone is pure Mamba; Mamba projections (in_proj/out_proj/etc.)
+            # use a CUDA fast path that accesses .weight directly, bypassing the LoRA wrapper.
+            # mlp.linear1/linear2 are standard PyTorch Linear called normally via MLPBlock.forward.
+            target_modules=["linear1", "linear2"],
             modules_to_save=["projector"],
             lora_dropout=config.train.lora_dropout,
             bias="none",
@@ -38,11 +41,20 @@ class ContrastiveModel(L.LightningModule):
         self.eeg_encoder  = get_peft_model(self.eeg_encoder, eeg_lora)
         self.fmri_encoder = get_peft_model(self.fmri_encoder, fmri_lora)
 
+        def _param_breakdown(label, peft_model):
+            lora  = sum(p.numel() for n, p in peft_model.named_parameters() if "lora_A" in n or "lora_B" in n)
+            proj  = sum(p.numel() for n, p in peft_model.named_parameters() if "projector" in n and p.requires_grad)
+            total = sum(p.numel() for p in peft_model.parameters())
+            print(f"[{label}]  LoRA={lora:,}  projector={proj:,}  total_trainable={lora+proj:,}  frozen={total-lora-proj:,}")
+
+        _param_breakdown("EEG ", self.eeg_encoder)
+        _param_breakdown("fMRI", self.fmri_encoder)
+
         self.eeg_augmentor = EEGAugmentor(config)
         self.fmri_augmentor = FmriAugmentor(config)
 
         # buffers for accumulating val embeddings across batches
-        self._val_eeg, self._val_fmri = [], []
+        self._val_eeg, self._val_fmri, self._val_subs = [], [], []
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor):
         x2 = x2.unsqueeze(1) #shape will be (B, 1, X, Y, Z, T)
@@ -123,9 +135,18 @@ class ContrastiveModel(L.LightningModule):
         projector_opt.zero_grad()
         self.manual_backward(loss)
 
+        lora_grads = [p.grad for n, p in self.named_parameters() if "projector" not in n and p.requires_grad and p.grad is not None]
+        proj_grads = [p.grad for n, p in self.named_parameters() if "projector" in n and p.requires_grad and p.grad is not None]
+        lora_norm = torch.stack([g.norm(2) for g in lora_grads]).norm(2) if lora_grads else torch.zeros(1, device=self.device)
+        proj_norm = torch.stack([g.norm(2) for g in proj_grads]).norm(2) if proj_grads else torch.zeros(1, device=self.device)
+
         trainable = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=self.config.train.grad_clip_val)
         self.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False)
+        self.log("train/lora_grad_norm", lora_norm, on_step=True, on_epoch=False)
+        self.log("train/proj_grad_norm", proj_norm, on_step=True, on_epoch=False)
+        if proj_norm > 0:
+            self.log("train/lora_proj_grad_ratio", lora_norm / proj_norm, on_step=True, on_epoch=False)
 
         curr_grads = torch.cat([p.grad.flatten() for p in trainable]).detach()
         if hasattr(self, "_prev_grads"):
@@ -163,6 +184,23 @@ class ContrastiveModel(L.LightningModule):
             self.log("train/sim_neg", sim_neg)
             self.log("train/sim_gap", sim_pos - sim_neg, prog_bar=True)
 
+            # subject-identity diagnostic: split negatives into same-subject vs cross-subject
+            subs = batch.get("sub")
+            if subs is not None:
+                sub_ids = torch.tensor(
+                    [hash(s) & 0x7FFF_FFFF for s in subs], device=sim.device
+                )
+                same_sub  = sub_ids.unsqueeze(0) == sub_ids.unsqueeze(1)   # [B, B]
+                neg_same  = ~mask_pos &  same_sub
+                neg_cross = ~mask_pos & ~same_sub
+                if neg_same.any():
+                    self.log("train/sim_neg_same_sub",  sim[neg_same].mean(), on_step=True)
+                if neg_cross.any():
+                    self.log("train/sim_neg_diff_sub",  sim[neg_cross].mean(), on_step=True)
+                if neg_same.any() and neg_cross.any():
+                    self.log("train/sim_neg_id_gap",
+                             sim[neg_same].mean() - sim[neg_cross].mean(), on_step=True)
+
         return loss
 
     def on_validation_epoch_start(self):
@@ -178,6 +216,8 @@ class ContrastiveModel(L.LightningModule):
         # store on CPU to avoid filling GPU memory during long val epochs
         self._val_eeg.append(eeg_pred.detach())
         self._val_fmri.append(fmri_pred.detach())
+        if batch.get("sub") is not None:
+            self._val_subs.extend(batch["sub"])
 
     def on_validation_epoch_end(self):
         with open("val_debug.log", "a") as f:
@@ -187,8 +227,10 @@ class ContrastiveModel(L.LightningModule):
 
         z_e = torch.cat(self._val_eeg, dim=0).float()   # [B, D]
         z_f = torch.cat(self._val_fmri, dim=0).float()
+        val_subs = list(self._val_subs)
         self._val_eeg.clear()
         self._val_fmri.clear()
+        self._val_subs.clear()
 
         z_en = F.normalize(z_e, dim=-1)
         z_fn = F.normalize(z_f, dim=-1)
@@ -213,6 +255,28 @@ class ContrastiveModel(L.LightningModule):
 
         self.log("val/mrr_f2e", (1.0 / rank).mean())
         self.log("val/mrr_e2f", (1.0 / rank_T).mean(), prog_bar=True)
+
+        # subject identity decoding — nearest-centroid probe on val embeddings.
+        # If accuracy >> 1/n_subjects, the embeddings encode who, not what.
+        if len(val_subs) == z_e.shape[0] and len(set(val_subs)) >= 2:
+            unique_subs = sorted(set(val_subs))
+            n_subs = len(unique_subs)
+            sub2idx = {s: i for i, s in enumerate(unique_subs)}
+            labels  = torch.tensor([sub2idx[s] for s in val_subs], device=z_en.device)
+
+            def _nearest_centroid_acc(z):
+                centroids = torch.zeros(n_subs, z.shape[1], device=z.device)
+                for i in range(n_subs):
+                    mask = labels == i
+                    if mask.any():
+                        centroids[i] = z[mask].mean(0)
+                centroids = F.normalize(centroids, dim=-1)
+                preds = (z @ centroids.T).argmax(dim=1)
+                return (preds == labels).float().mean()
+
+            self.log("val/sub_decode_eeg",  _nearest_centroid_acc(z_en))
+            self.log("val/sub_decode_fmri", _nearest_centroid_acc(z_fn))
+            self.log("val/sub_chance",      torch.tensor(1.0 / n_subs))
         
     def configure_optimizers(self):
         backbone_params, projector_params = [], []
@@ -235,17 +299,22 @@ class ContrastiveModel(L.LightningModule):
             weight_decay=self.config.train.weight_decay,
         )
         def make_scheduler(opt):
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                opt, start_factor=0.1, end_factor=1.0,
-                total_iters=self.config.train.warmup_steps,
-            )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
-            )
-            return torch.optim.lr_scheduler.SequentialLR(
-                opt, schedulers=[warmup, cosine],
-                milestones=[self.config.train.warmup_steps],
-            )
+            if self.config.train.scheduler == "warmup_cosine":
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=0.1, end_factor=1.0,
+                    total_iters=self.config.train.warmup_steps,
+                )
+                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
+                )
+                return torch.optim.lr_scheduler.SequentialLR(
+                    opt, schedulers=[warmup, cosine],
+                    milestones=[self.config.train.warmup_steps],
+                )
+            elif self.config.train.scheduler == "const":
+                return torch.optim.lr_scheduler.LinearLR(opt,
+                start_factor=1,
+                end_factor=1)
 
         return (
             [backbone_opt, projector_opt],
