@@ -57,6 +57,42 @@ def multi_positive_clip_loss(z_f: torch.Tensor, z_e: torch.Tensor, tau=0.07):
     return 0.5 * (loss_f2e + loss_e2f)
 
 
+def within_subject_clip_loss(z_f, z_e, sub_id, slot_id, tau=0.07):
+    """
+    Identity-controlled contrastive term (hard-negative on the subject axis).
+
+    For each anchor the candidate pool is restricted to embeddings of the SAME
+    subject; the positive is the same task-moment (same slot_id). Because every
+    candidate shares the subject, subject identity carries no discriminative
+    information — the loss can only drop by separating different MOMENTS of the
+    same subject, which is exactly the temporal signal the plain batch InfoNCE
+    lets the model skip via an identity shortcut.
+
+    z_f, z_e: [B, D] fMRI / EEG embeddings (raw; normalized inside).
+    sub_id, slot_id: [B] long tensors.
+        sub_id[i]  == sub_id[j]  ⇔ same subject (defines the candidate pool)
+        slot_id[i] == slot_id[j] ⇔ same task-moment (defines the positives)
+
+    Rows whose subject is unique in the batch have no same-subject negative;
+    for them numerator == denominator, so they contribute exactly 0 (no signal),
+    never a NaN.
+    """
+    z_f = F.normalize(z_f, dim=-1)
+    z_e = F.normalize(z_e, dim=-1)
+    logits = (z_f @ z_e.T) / tau                         # [B, B]
+
+    pos      = slot_id[:, None] == slot_id[None, :]      # positives
+    same_sub = sub_id[:, None]  == sub_id[None, :]       # candidate pool
+
+    def step(l):
+        l   = l.masked_fill(~same_sub, float("-inf"))    # keep same-subject cols
+        num = torch.logsumexp(l.masked_fill(~pos, float("-inf")), dim=1)
+        den = torch.logsumexp(l, dim=1)
+        return -(num - den).mean()
+
+    return 0.5 * (step(logits) + step(logits.T))
+
+
 def alignment_metric(z_f: torch.Tensor, z_e: torch.Tensor) -> torch.Tensor:
     """
     Mean cosine distance between EEG and fMRI embeddings for the same time point.

@@ -265,87 +265,90 @@ def collate_fn(batch):
         eeg_tensors.append(eeg)
         fmri_tensors.append(s["fmri"])
 
+    # batch-local integer codes for the identity-controlled contrastive term:
+    # sub_id groups rows by subject, slot_id groups by task-moment (run, tr).
+    # Codes only need to be consistent WITHIN the batch (used for equality masks).
+    subs  = [s["sub"] for s in batch]
+    slots = [(s["run"], int(s["tr_idx"])) for s in batch]
+    sub_code  = {v: i for i, v in enumerate(dict.fromkeys(subs))}
+    slot_code = {v: i for i, v in enumerate(dict.fromkeys(slots))}
+
     return {
         "eeg":      torch.stack(eeg_tensors),
         "fmri":     torch.stack(fmri_tensors),
         "ch_names": common_ordered,
+        "sub_id":   torch.tensor([sub_code[v]  for v in subs],  dtype=torch.long),
+        "slot_id":  torch.tensor([slot_code[v] for v in slots], dtype=torch.long),
     }
 
 
 class ContrastiveBatchSampler(Sampler):
     """
-    Hierarchical R x T sampler. Each batch contains:
-      - R distinct recordings
-      - T margin-separated TRs from each recording
-      - K subjects per (rec, tr) slot
-    so total batch size = R * T * K, with M := R * T = num_timestamps.
+    Hierarchical R x T sampler keyed by (subject, activity) blocks. Each batch:
+      - R distinct blocks, where a block is one (subject, activity) recording
+      - T margin-separated TRs from each block (all the SAME subject)
+    so total batch size = R * T = M.
 
-    Why hierarchical (and not flat cross-recording):
-    A flat cross-recording batch effectively has every slot from a different
-    recording. The contrastive task then reduces to "identify which fMRI shares
-    its recording with this EEG", solvable via subject/anatomy/electrode-placement
-    signatures alone — no temporal alignment learned. Train metrics improve, but
-    val (with unseen subjects) stays at random because that shortcut doesn't
-    transfer.
+    Why blocks are single-subject:
+    The contrastive loss reduces its loss via whatever feature separates the
+    positive from the in-batch negatives. If the hard (high-similarity) negatives
+    were different subjects, "which subject is this" would solve matching via
+    anatomy / electrode-placement / spectral fingerprint alone — a shortcut that
+    learns no temporal alignment and stays at chance on unseen subjects.
 
-    With R x T, each query has T-1 in-batch negatives FROM THE SAME RECORDING
-    (different TRs of the same subject). Subject identity is constant across
-    those, so it cannot be used to discriminate — the model must learn actual
-    TR-level EEG-fMRI alignment. The (R-1) * T cross-recording slots remain as
-    easy negatives for diversity.
+    By drawing all T TRs of a block from ONE subject, each query gets T-1 in-block
+    negatives that are same-subject / different-moment. Subject identity is then
+    constant across the pool and carries no discriminative information — the model
+    can only separate them via TR-level EEG-fMRI alignment, which is the signal we
+    actually want. The (R-1) * T cross-block slots remain as easy negatives for
+    diversity.
 
-    `margin_tr` applies between two TRs of the same recording within one batch
-    (so the T same-recording slots are temporally decorrelated). Across
-    recordings, no margin is needed — BOLD signals are unrelated regardless of
-    TR index.
+    A block is keyed by (sub, act_key); the same subject doing the same act_key
+    across multiple sessions is merged (one TR index may map to several samples,
+    one is chosen at random). Each slot is a single sample — num_subjects has no
+    effect here.
+
+    `margin_tr` applies between two TRs of the same block (so the T same-subject
+    slots are temporally decorrelated). Across blocks no margin is needed — BOLD
+    signals are unrelated regardless of TR index.
     """
     def __init__(self, dataset: SimultEEG_fMRI, config: TrainConfig):
         self.dataset = dataset
         self.T       = config.data.num_timestamps
         self.R       = config.data.num_recordings
-        self.K       = config.data.num_subjects
         self.margin  = config.data.margin_tr
         self.M       = self.R * self.T
 
-        # run -> tr -> sub -> list of dataset indices for this (run, tr, sub).
-        # A subject may appear multiple times at the same (run, tr) when they did
-        # the same act_key across multiple sessions — those belong to one subject
-        # and must not be treated as separate "subjects" by the K-of-N pick.
-        run_tr_sub: dict = defaultdict(
-            lambda: defaultdict(lambda: defaultdict(list))
-        )
+        # block (subject, activity) -> tr -> list of dataset indices
+        block_trs: dict = defaultdict(lambda: defaultdict(list))
         for idx, meta in enumerate(self.dataset.meta):
-            run_tr_sub[meta['run']][meta['tr']][meta['sub']].append(idx)
-        self.run_tr_sub = run_tr_sub
-
-        # per-recording: TRs that have ≥ K distinct subjects available
-        self.run_usable_trs = {
-            run: [tr for tr, sub_dict in tr_dict.items() if len(sub_dict) >= self.K]
-            for run, tr_dict in self.run_tr_sub.items()
+            block_trs[(meta['sub'], meta['run'])][meta['tr']].append(idx)
+        self.block_trs = block_trs
+        self.block_usable_trs = {
+            blk: list(trs.keys())
+            for blk, trs in block_trs.items()
+            if len(trs) >= self.T
         }
 
     def __iter__(self):
-        # consumable per-recording TR pool — each TR drawn at most once per epoch
-        remaining = {run: list(trs) for run, trs in self.run_usable_trs.items()}
+        # consumable per-block TR pool — each TR drawn at most once per epoch
+        remaining = {blk: list(trs) for blk, trs in self.block_usable_trs.items()}
 
         while True:
-            # recordings still holding ≥ T usable TRs (necessary but not sufficient:
-            # greedy margin pack may still fail, in which case we skip and try
-            # another recording from the eligible pool)
-            eligible = [run for run, trs in remaining.items() if len(trs) >= self.T]
+            eligible = [blk for blk, trs in remaining.items() if len(trs) >= self.T]
             if len(eligible) < self.R:
                 return
 
             random.shuffle(eligible)
 
-            batch_slots = []     # list[(run, tr)] in PK layout: T per run, R runs
-            picked_recs = 0
-            for run in eligible:
-                if picked_recs == self.R:
+            batch_indices = []
+            picked = 0
+            for blk in eligible:
+                if picked == self.R:
                     break
 
-                # greedy: pick T margin-separated TRs from this recording's pool
-                pool = list(remaining[run])
+                # greedy: pick T margin-separated TRs from this block's pool
+                pool = list(remaining[blk])
                 random.shuffle(pool)
                 picked_trs = []
                 for tr in pool:
@@ -355,31 +358,20 @@ class ContrastiveBatchSampler(Sampler):
                             break
 
                 if len(picked_trs) < self.T:
-                    # margin-packing failed for this recording this batch — try next
-                    continue
+                    continue  # margin-pack failed for this block this batch
 
                 for tr in picked_trs:
-                    remaining[run].remove(tr)
-                    batch_slots.append((run, tr))
-                picked_recs += 1
+                    remaining[blk].remove(tr)
+                    batch_indices.append(random.choice(self.block_trs[blk][tr]))
+                picked += 1
 
-            if picked_recs < self.R:
+            if picked < self.R:
                 return  # epoch tail — cannot fill another full batch
 
-            # K-subject pick per slot
-            batch_indices = []
-            for run, tr in batch_slots:
-                sub_dict = self.run_tr_sub[run][tr]
-                chosen_subs = random.sample(list(sub_dict.keys()), self.K)
-                for sub in chosen_subs:
-                    batch_indices.append(random.choice(sub_dict[sub]))
             yield batch_indices
 
     def __len__(self):
-        # upper-bound estimate: total usable TRs in eligible recordings, divided
+        # upper-bound estimate: total usable TRs across eligible blocks, divided
         # by M. Greedy margin-pack failures may slightly reduce actual count.
-        total = sum(
-            len(trs) for trs in self.run_usable_trs.values()
-            if len(trs) >= self.T
-        )
+        total = sum(len(trs) for trs in self.block_usable_trs.values())
         return total // self.M

@@ -91,6 +91,12 @@ class TrainingConfig:
     num_epochs:int = 100
     tau: float = 0.07 #for infonce loss
 
+    # identity-controlled hard-negative contrastive term (see within_subject_clip_loss).
+    # 0.0 -> disabled (legacy global-only InfoNCE). >0 -> add lambda * within-subject
+    # loss that ranks the true moment above OTHER moments of the SAME subject,
+    # removing the subject-identity shortcut. Start with ~1.0 for an A/B run.
+    within_subject_weight: float = 0
+
     freeze_backbone: bool = True
 
     #lora params
@@ -104,6 +110,13 @@ class TrainingConfig:
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
+
+    # cross-validation: n_folds=1 keeps the original single train/val/test split.
+    # n_folds > 1 holds out test_ratio subjects as a FIXED test set and rotates
+    # which (1/n_folds) slice of the remainder is used as val. Set cv_fold to
+    # 0..n_folds-1 and run training that many times.
+    n_folds: int = 5
+    cv_fold: int = 0
     
     seed: int = 42
     num_workers: int = 8
@@ -118,7 +131,7 @@ class TrainingConfig:
     max_steps: int = 5000
 
     wandb_project: str = "shevchuk-bs-thesis"
-    wandb_group: str = "overfit-sanity"
+    wandb_group: str = "new_sampler_new_loss"
 
     profile: bool = False  # run torch.profiler for a few steps then exit
 

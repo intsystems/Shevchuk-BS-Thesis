@@ -4,7 +4,7 @@ import lightning as L
 from src.eeg_encoder import EEGAugmentor
 from src.fmri_encoder import FmriAugmentor
 from train.config import TrainConfig
-from src.utils.utils import multi_positive_clip_loss, alignment_metric, effective_rank
+from src.utils.utils import multi_positive_clip_loss, within_subject_clip_loss, alignment_metric, effective_rank
 from peft import LoraConfig, get_peft_model
 
 class ContrastiveModel(L.LightningModule):
@@ -62,6 +62,8 @@ class ContrastiveModel(L.LightningModule):
     def on_after_batch_transfer(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
         ch_names  = batch.get("ch_names")   # carried through as Python list (collate keeps it)
+        sub_id    = batch.get("sub_id")     # [B] long, for the identity-controlled loss term
+        slot_id   = batch.get("slot_id")    # [B] long, task-moment grouping
 
         # fMRI is kept as float16 through CPU/worker pipeline to halve memory; cast here on GPU.
         fmri = fmri.float()
@@ -71,7 +73,8 @@ class ContrastiveModel(L.LightningModule):
             eeg = eeg.squeeze(1)
 
         if not self.training or not self.config.train.using_aug:
-            return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names}
+            return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names,
+                    "sub_id": sub_id, "slot_id": slot_id}
 
         # EEGAugmentor expects (B, C, T). For multi-HRF input (B, K_hrf, C, T)
         # fold K_hrf into batch so each shift is independently augmented, then
@@ -82,7 +85,8 @@ class ContrastiveModel(L.LightningModule):
         else:
             eeg_aug = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
-        return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names}
+        return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names,
+                "sub_id": sub_id, "slot_id": slot_id}
 
     def training_step(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
@@ -97,6 +101,21 @@ class ContrastiveModel(L.LightningModule):
         fmri_mk = fmri_pred.reshape(-1, K, D)
 
         loss = multi_positive_clip_loss(fmri_mk, eeg_mk, self.config.train.tau)
+
+        # identity-controlled hard-negative term: rank the true moment above OTHER
+        # moments of the SAME subject. Always logged as a diagnostic; only folded
+        # into the loss when weight > 0 (at weight=0 it's a pure metric, so compute
+        # under no_grad to skip building the unused autograd graph).
+        w = self.config.train.within_subject_weight
+        with torch.set_grad_enabled(w > 0):
+            loss_within = within_subject_clip_loss(
+                fmri_pred, eeg_pred,
+                batch["sub_id"], batch["slot_id"],
+                self.config.train.tau,
+            )
+        self.log("train/loss_within", loss_within, on_step=True, on_epoch=False)
+        if w > 0:
+            loss = loss + w * loss_within
 
         backbone_opt, projector_opt = self.optimizers()
         backbone_sched, projector_sched = self.lr_schedulers()

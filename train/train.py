@@ -27,17 +27,48 @@ def set_seed(seed):
 
 
 def split_subjects(config: TrainConfig):
+    """
+    Returns (train_subs, val_subs, test_subs) given the config.
+
+    If n_folds <= 1: legacy single split using train/val/test ratios.
+
+    If n_folds > 1: k-fold cross-subject CV.
+      - test_ratio * n subjects are held out as a FIXED test set (last slice
+        of the shuffled list), shared across all folds for honest test reporting.
+      - The remaining (n - n_test) subjects are deterministically partitioned
+        into n_folds contiguous slices; the cv_fold-th slice is val, the rest
+        is train. cv_fold ∈ [0, n_folds).
+    """
     rng = random.Random(config.train.seed)
     subjects = [f"sub-{i:02d}" for i in range(config.data.start_sub, config.data.end_sub + 1)]
     rng.shuffle(subjects)
-
     n = len(subjects)
-    n_train = int(n * config.train.train_ratio)
-    n_val   = int(n * config.train.val_ratio)
 
-    train_subs = subjects[:n_train]
-    val_subs   = subjects[n_train:n_train + n_val]
-    test_subs  = subjects[n_train + n_val:]
+    n_folds = config.train.n_folds
+    if n_folds <= 1:
+        n_train = int(n * config.train.train_ratio)
+        n_val   = int(n * config.train.val_ratio)
+        train_subs = subjects[:n_train]
+        val_subs   = subjects[n_train:n_train + n_val]
+        test_subs  = subjects[n_train + n_val:]
+        return train_subs, val_subs, test_subs
+
+    fold = config.train.cv_fold
+    if not (0 <= fold < n_folds):
+        raise ValueError(f"cv_fold={fold} must be in [0, {n_folds})")
+
+    n_test = int(n * config.train.test_ratio)
+    test_subs = subjects[n - n_test:] if n_test > 0 else []
+    pool = subjects[:n - n_test] if n_test > 0 else subjects[:]
+    m = len(pool)
+    if m < n_folds:
+        raise ValueError(f"pool of {m} subjects can't be split into {n_folds} folds")
+
+    fold_size = m // n_folds
+    start = fold * fold_size
+    end = start + fold_size if fold < n_folds - 1 else m  # last fold absorbs remainder
+    val_subs = pool[start:end]
+    train_subs = pool[:start] + pool[end:]
     return train_subs, val_subs, test_subs
 
 
@@ -223,9 +254,11 @@ def main():
         LearningRateMonitor(logging_interval="epoch"),
     ]
 
+    run_name = f"fold-{config.train.cv_fold}" if config.train.n_folds > 1 else None
     logger = WandbLogger(
         project=config.train.wandb_project,
         group=config.train.wandb_group,
+        name=run_name,
         save_dir="logs",
         config=asdict(config),
     )
