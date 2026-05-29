@@ -141,6 +141,15 @@ class EEGEncoder(nn.Module):
                 p.requires_grad = False
             self.backbone.eval()
 
+        # Per-block gradient checkpointing: the outer single-checkpoint approach
+        # saves nothing during forward but recomputes ALL blocks at once during
+        # backward, hitting OOM on the attention softmax. Wrapping each block
+        # individually limits peak memory to one block's attention matrix at a time.
+        from torch.utils.checkpoint import checkpoint as _ckpt
+        for blk in self.backbone.blocks:
+            _fwd = blk.forward
+            blk.forward = lambda x, f=_fwd: _ckpt(f, x, use_reentrant=False)
+
         # cache LaBraM's 128-channel reference montage for ch_name → index lookup
         # convention: positional index 0 is CLS, channels start at 1
         self._ref_names = [c["ch_name"].upper() for c in self.backbone.chs_info]
@@ -170,17 +179,7 @@ class EEGEncoder(nn.Module):
         if ch_names is None:
             ch_names = self.ch_names
         input_chans = self._build_input_chans(ch_names, x.device)
-        if self.training:
-            from torch.utils.checkpoint import checkpoint
-            # Recompute activations during backward instead of caching them.
-            # Labram has 12 blocks each producing ~415 MB attention matrices in bf16;
-            # storing all of them for backprop exceeds GPU budget at batch 32.
-            cls = checkpoint(
-                lambda x_: self.backbone.forward_features(x_, input_chans=input_chans),
-                x, use_reentrant=False,
-            )
-        else:
-            cls = self.backbone.forward_features(x, input_chans=input_chans)
+        cls = self.backbone.forward_features(x, input_chans=input_chans)
         if cls.dim() == 3:                # safety: (B, num_tokens, D) → take CLS
             cls = cls[:, 0]
         return self.projector(cls)

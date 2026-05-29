@@ -25,7 +25,7 @@ class DataConfig:
     eeg_sr: int = 200
     tr: float = 2.1 #sampling rate of fmri, in sec
     eeg_win_sec: int = 15 #window size, for eeg and fmri, in sec
-    hrf_shifts_sec: list = field(default_factory=lambda: [2.1, 4.2, 6.3])
+    hrf_shifts_sec: list = field(default_factory=lambda: [4.2])
     stride_tr: int = 1 #shift inside one activity, in trs
     n_eeg_channels: int = 60
     ch_names: list = field(default_factory=lambda: ['Fp1', 'Fp2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T7', 'T8', 'P7', 'P8', 'Fz', 'Cz', 'Pz', 'Oz', 'FC1', 'FC2', 'CP1', 'CP2', 'FC5', 'FC6', 'CP5', 'CP6', 'TP9', 'TP10', 'POz', 'F1', 'F2', 'C1', 'C2', 'P1', 'P2', 'AF3', 'AF4', 'FC3', 'CP3', 'CP4', 'PO3', 'PO4', 'F5', 'F6', 'C5', 'C6', 'P5', 'P6', 'AF7', 'AF8', 'FT7', 'FT8', 'TP7', 'TP8', 'PO7', 'PO8', 'Fpz', 'CPz'])
@@ -53,8 +53,8 @@ class DataConfig:
     #batch sampler settings (hierarchical R x T):
     num_timestamps: int = 8 #T: TRs sampled from each recording per batch
     num_recordings: int = 8 #R: distinct recordings per batch. Total slots per batch = R * T; forces same-recording hard negatives so the model cannot solve contrastive matching via subject identity alone.
-    num_subjects: int = 2 #K: subjects per (rec, tr) slot (multi-positive count)
-    margin_tr: int = 2 #minimal fMRI frames between two TRs of the SAME recording in one batch
+    num_subjects: int = 1 #K: subjects per (rec, tr) slot (multi-positive count)
+    margin_tr: int = 5 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
 @dataclass
 class ModelConfig:
@@ -91,13 +91,13 @@ class TrainingConfig:
     scheduler: str = "warmup_cosine"
     warmup_steps: int = 50
     num_epochs:int = 100
-    tau: float = 0.07 #for infonce loss
+    tau: float = 0.05 #for infonce loss
 
     # identity-controlled hard-negative contrastive term (see within_subject_clip_loss).
     # 0.0 -> disabled (legacy global-only InfoNCE). >0 -> add lambda * within-subject
     # loss that ranks the true moment above OTHER moments of the SAME subject,
     # removing the subject-identity shortcut. Start with ~1.0 for an A/B run.
-    within_subject_weight: float = 0
+    within_subject_weight: float = 0.1
 
     freeze_backbone: bool = True
 
@@ -121,7 +121,7 @@ class TrainingConfig:
     cv_fold: int = 0
     
     seed: int = 42
-    num_workers: int = 6
+    num_workers: int = 10
     save_every:int = 5
 
     using_aug: bool = True
@@ -131,6 +131,10 @@ class TrainingConfig:
     # batch every step; max_steps=-1 disables step limit (combine with num_epochs).
     overfit_batches: int = 0
     max_steps: int = 5000
+    val_every_n_steps: int = 50
+    limit_val_batches: int = 30  # cap validation at N batches per check (~30×64=1920 samples)
+
+    variance_weight: float = 0.3  # VICReg variance term: penalizes embedding dims with std < 1
 
     wandb_project: str = "shevchuk-bs-thesis"
     wandb_group: str = "new_sampler_new_loss"

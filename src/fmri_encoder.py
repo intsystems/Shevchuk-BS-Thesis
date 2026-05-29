@@ -152,8 +152,10 @@ class FMRIProjectionHead(nn.Module):
         """
         Input: (B, 288, 2, 2, 2, T)
         """
-        # 1. Spatiotemporal Pooling: усредняем по X, Y, Z и T (индексы 2, 3, 4, 5)
-        x_pooled = x.mean(dim=(2, 3, 4, 5)) # Ожидаемый выход: (B, 288)
+        # Take the last TR (closest to HRF peak) and pool spatially only.
+        # Mean over all T blurs distinct brain states across the 8-TR window;
+        # a single TR gives a specific snapshot that pairs cleanly with the EEG window.
+        x_pooled = x[..., -1].mean(dim=(2, 3, 4))  # (B, 288)
         
         # 2. Проекция в общее пространство
         return self.mlp(x_pooled)

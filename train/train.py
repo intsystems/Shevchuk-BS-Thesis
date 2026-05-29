@@ -101,6 +101,7 @@ def build_loaders(config: TrainConfig):
         val_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
+        drop_last=True,
         num_workers=nw,
         collate_fn=collate_fn,
         pin_memory=False,
@@ -252,31 +253,23 @@ def main():
             every_n_epochs=config.train.save_every,
             save_last=True,
         ),
-        LearningRateMonitor(logging_interval="epoch"),
+        LearningRateMonitor(logging_interval="step"),
     ]
 
-<<<<<<< HEAD
-    run_name = f"fold-{config.train.cv_fold}" if config.train.n_folds > 1 else None
-    logger = WandbLogger(
-=======
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_logger = CSVLogger(save_dir="logs/runs", name=run_id, version="")
 
     wandb_logger = WandbLogger(
->>>>>>> d17972e8caa7dd5086e4b60f90f31f47667c98a1
         project=config.train.wandb_project,
         group=config.train.wandb_group,
-        name=run_name,
+        name=run_id,
         save_dir="logs",
         config=asdict(config),
     )
     logger = [wandb_logger, csv_logger]
     print(f"[LOG] local metrics → logs/runs/{run_id}/metrics.csv", flush=True)
 
-    # Use a fixed batch interval for validation so it triggers independently of
-    # epoch boundaries — the R x T sampler may yield fewer batches than __len__
-    # reports, which can confuse Lightning's epoch-end val scheduling.
-    val_every = max(50, len(train_loader)) if not config.train.overfit_batches else 10**9
+    val_every = config.train.val_every_n_steps if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,
@@ -291,6 +284,7 @@ def main():
         num_sanity_val_steps=0 if config.train.overfit_batches else 2,
         val_check_interval=val_every,
         check_val_every_n_epoch=None,
+        limit_val_batches=config.train.limit_val_batches,
         gradient_clip_val=None,  # manual optimization → clipping done in training_step via clip_grad_norm_
     )
     print(f"[TRAIN] val_check_interval={val_every} batches", flush=True)

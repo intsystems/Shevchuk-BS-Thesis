@@ -4,7 +4,7 @@ import lightning as L
 from src.eeg_encoder import EEGAugmentor
 from src.fmri_encoder import FmriAugmentor
 from train.config import TrainConfig
-from src.utils.utils import multi_positive_clip_loss, within_subject_clip_loss, alignment_metric, effective_rank
+from src.utils.utils import multi_positive_clip_loss, within_subject_clip_loss, alignment_metric, effective_rank, _variance_loss
 from peft import LoraConfig, get_peft_model
 
 class ContrastiveModel(L.LightningModule):
@@ -129,6 +129,12 @@ class ContrastiveModel(L.LightningModule):
         if w > 0:
             loss = loss + w * loss_within
 
+        vw = self.config.train.variance_weight
+        if vw > 0:
+            loss_var = _variance_loss(eeg_pred) + _variance_loss(fmri_pred)
+            self.log("train/loss_var", loss_var, on_step=True, on_epoch=False)
+            loss = loss + vw * loss_var
+
         backbone_opt, projector_opt = self.optimizers()
         backbone_sched, projector_sched = self.lr_schedulers()
         backbone_opt.zero_grad()
@@ -183,6 +189,17 @@ class ContrastiveModel(L.LightningModule):
             self.log("train/sim_pos", sim_pos)
             self.log("train/sim_neg", sim_neg)
             self.log("train/sim_gap", sim_pos - sim_neg, prog_bar=True)
+            self.log("train/sim_pos_std", sim[mask_pos].std())
+            self.log("train/sim_neg_std", sim[~mask_pos].std())
+
+            mu_e = F.normalize(ze.mean(0, keepdim=True), dim=-1)
+            mu_f = F.normalize(zf.mean(0, keepdim=True), dim=-1)
+            self.log("train/modality_gap", 1.0 - (mu_e * mu_f).sum())
+
+            off_diag = ~torch.eye(B, dtype=torch.bool, device=sim.device)
+            self.log("train/intra_eeg_sim",  (ze @ ze.T)[off_diag].mean())
+            self.log("train/intra_fmri_sim", (zf @ zf.T)[off_diag].mean())
+            self.log("train/cross_modal_sim", sim.mean())
 
             # subject-identity diagnostic: split negatives into same-subject vs cross-subject
             subs = batch.get("sub")
@@ -255,6 +272,29 @@ class ContrastiveModel(L.LightningModule):
 
         self.log("val/mrr_f2e", (1.0 / rank).mean())
         self.log("val/mrr_e2f", (1.0 / rank_T).mean(), prog_bar=True)
+
+        # --- diagnostic metrics ---
+        B = z_fn.shape[0]
+        off_diag = ~torch.eye(B, dtype=torch.bool, device=z_fn.device)
+
+        # sim_gap on val: how much positives outrank negatives
+        sim_pos_vals = sim.diag()                          # [B]
+        sim_neg_vals = sim[off_diag]                       # [B*(B-1)]
+        self.log("val/sim_gap",      sim_pos_vals.mean() - sim_neg_vals.mean())
+        self.log("val/sim_pos_std",  sim_pos_vals.std())
+        self.log("val/sim_neg_std",  sim_neg_vals.std())
+
+        # modality gap: cosine distance between embedding cloud centroids
+        mu_e = F.normalize(z_en.mean(0, keepdim=True), dim=-1)
+        mu_f = F.normalize(z_fn.mean(0, keepdim=True), dim=-1)
+        self.log("val/modality_gap", 1.0 - (mu_e * mu_f).sum())
+
+        # intra-modal similarity: how similar embeddings are within each modality
+        sim_ee = z_en @ z_en.T
+        sim_ff = z_fn @ z_fn.T
+        self.log("val/intra_eeg_sim",  sim_ee[off_diag].mean())
+        self.log("val/intra_fmri_sim", sim_ff[off_diag].mean())
+        self.log("val/cross_modal_sim", sim.mean())
 
         # subject identity decoding — nearest-centroid probe on val embeddings.
         # If accuracy >> 1/n_subjects, the embeddings encode who, not what.
