@@ -90,6 +90,11 @@ class TrainingConfig:
 
     scheduler: str = "warmup_cosine"
     warmup_steps: int = 50
+    # LP-FT staging: hold the backbone (LoRA) LR at ~0 for this many steps so only
+    # the projectors train first, then ramp LoRA into the normal warmup→cosine.
+    # 0 -> disabled (LoRA trains from step 0). Only affects the backbone optimizer;
+    # the projector optimizer always warms up from step 0.
+    proj_warmup_steps: int = 0
     num_epochs:int = 100
     tau: float = 0.05 #for infonce loss
 

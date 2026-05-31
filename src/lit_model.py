@@ -338,28 +338,45 @@ class ContrastiveModel(L.LightningModule):
             lr=self.config.train.proj_lr,
             weight_decay=self.config.train.weight_decay,
         )
-        def make_scheduler(opt):
+        def make_scheduler(opt, zero_steps=0):
+            """zero_steps: hold LR at ~0 for this many steps before the main schedule
+            (LP-FT: train projectors first, then ramp LoRA in). Applies to whichever
+            schedule the config selects."""
+            warmup_steps = self.config.train.warmup_steps
+            # `main`: schedulers active from step `zero_steps` onward; `main_ms`:
+            # their switch points as offsets WITHIN the main schedule.
             if self.config.train.scheduler == "warmup_cosine":
-                warmup = torch.optim.lr_scheduler.LinearLR(
-                    opt, start_factor=0.1, end_factor=1.0,
-                    total_iters=self.config.train.warmup_steps,
-                )
-                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    opt, T_max=max(1, self.config.train.max_steps - self.config.train.warmup_steps),
-                )
-                return torch.optim.lr_scheduler.SequentialLR(
-                    opt, schedulers=[warmup, cosine],
-                    milestones=[self.config.train.warmup_steps],
-                )
+                main = [
+                    torch.optim.lr_scheduler.LinearLR(
+                        opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+                    ),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        opt, T_max=max(1, self.config.train.max_steps - zero_steps - warmup_steps),
+                    ),
+                ]
+                main_ms = [warmup_steps]
             elif self.config.train.scheduler == "const":
-                return torch.optim.lr_scheduler.LinearLR(opt,
-                start_factor=1,
-                end_factor=1)
+                main = [torch.optim.lr_scheduler.LinearLR(opt, start_factor=1, end_factor=1)]
+                main_ms = []
+
+            if zero_steps > 0:
+                # ConstantLR forbids factor=0; 1e-8 makes the LR negligibly small.
+                zero = torch.optim.lr_scheduler.ConstantLR(opt, factor=1e-8, total_iters=zero_steps)
+                schedulers = [zero] + main
+                milestones = [zero_steps] + [zero_steps + m for m in main_ms]
+            else:
+                schedulers, milestones = main, main_ms
+
+            if len(schedulers) == 1:
+                return schedulers[0]
+            return torch.optim.lr_scheduler.SequentialLR(
+                opt, schedulers=schedulers, milestones=milestones,
+            )
 
         return (
             [backbone_opt, projector_opt],
             [
-                {"scheduler": make_scheduler(backbone_opt), "interval": "step"},
+                {"scheduler": make_scheduler(backbone_opt, zero_steps=self.config.train.proj_warmup_steps), "interval": "step"},
                 {"scheduler": make_scheduler(projector_opt), "interval": "step"},
             ],
         )

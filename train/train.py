@@ -28,48 +28,17 @@ def set_seed(seed):
 
 
 def split_subjects(config: TrainConfig):
-    """
-    Returns (train_subs, val_subs, test_subs) given the config.
-
-    If n_folds <= 1: legacy single split using train/val/test ratios.
-
-    If n_folds > 1: k-fold cross-subject CV.
-      - test_ratio * n subjects are held out as a FIXED test set (last slice
-        of the shuffled list), shared across all folds for honest test reporting.
-      - The remaining (n - n_test) subjects are deterministically partitioned
-        into n_folds contiguous slices; the cv_fold-th slice is val, the rest
-        is train. cv_fold ∈ [0, n_folds).
-    """
     rng = random.Random(config.train.seed)
     subjects = [f"sub-{i:02d}" for i in range(config.data.start_sub, config.data.end_sub + 1)]
     rng.shuffle(subjects)
+
     n = len(subjects)
+    n_train = int(n * config.train.train_ratio)
+    n_val   = int(n * config.train.val_ratio)
 
-    n_folds = config.train.n_folds
-    if n_folds <= 1:
-        n_train = int(n * config.train.train_ratio)
-        n_val   = int(n * config.train.val_ratio)
-        train_subs = subjects[:n_train]
-        val_subs   = subjects[n_train:n_train + n_val]
-        test_subs  = subjects[n_train + n_val:]
-        return train_subs, val_subs, test_subs
-
-    fold = config.train.cv_fold
-    if not (0 <= fold < n_folds):
-        raise ValueError(f"cv_fold={fold} must be in [0, {n_folds})")
-
-    n_test = int(n * config.train.test_ratio)
-    test_subs = subjects[n - n_test:] if n_test > 0 else []
-    pool = subjects[:n - n_test] if n_test > 0 else subjects[:]
-    m = len(pool)
-    if m < n_folds:
-        raise ValueError(f"pool of {m} subjects can't be split into {n_folds} folds")
-
-    fold_size = m // n_folds
-    start = fold * fold_size
-    end = start + fold_size if fold < n_folds - 1 else m  # last fold absorbs remainder
-    val_subs = pool[start:end]
-    train_subs = pool[:start] + pool[end:]
+    train_subs = subjects[:n_train]
+    val_subs   = subjects[n_train:n_train + n_val]
+    test_subs  = subjects[n_train + n_val:]
     return train_subs, val_subs, test_subs
 
 
@@ -101,7 +70,6 @@ def build_loaders(config: TrainConfig):
         val_ds,
         batch_size=config.train.batch_size,
         shuffle=False,
-        drop_last=True,
         num_workers=nw,
         collate_fn=collate_fn,
         pin_memory=False,
@@ -253,7 +221,7 @@ def main():
             every_n_epochs=config.train.save_every,
             save_last=True,
         ),
-        LearningRateMonitor(logging_interval="step"),
+        LearningRateMonitor(logging_interval="epoch"),
     ]
 
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -262,14 +230,16 @@ def main():
     wandb_logger = WandbLogger(
         project=config.train.wandb_project,
         group=config.train.wandb_group,
-        name=run_id,
         save_dir="logs",
         config=asdict(config),
     )
     logger = [wandb_logger, csv_logger]
     print(f"[LOG] local metrics → logs/runs/{run_id}/metrics.csv", flush=True)
 
-    val_every = config.train.val_every_n_steps if not config.train.overfit_batches else 10**9
+    # Use a fixed batch interval for validation so it triggers independently of
+    # epoch boundaries — the R x T sampler may yield fewer batches than __len__
+    # reports, which can confuse Lightning's epoch-end val scheduling.
+    val_every = max(50, len(train_loader)) if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,
@@ -284,7 +254,6 @@ def main():
         num_sanity_val_steps=0 if config.train.overfit_batches else 2,
         val_check_interval=val_every,
         check_val_every_n_epoch=None,
-        limit_val_batches=config.train.limit_val_batches,
         gradient_clip_val=None,  # manual optimization → clipping done in training_step via clip_grad_norm_
     )
     print(f"[TRAIN] val_check_interval={val_every} batches", flush=True)

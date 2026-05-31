@@ -118,6 +118,12 @@ class SimultEEG_fMRI(Dataset):
         self.index = np.array(self._index_list, dtype=np.int64)  # (N, 2)
         del self._index_list
 
+        # global moment id = (stimulus activity, nominal tr), shared across subjects /
+        # runs / sessions. This is the multi-positive grouping key and the memory-bank
+        # queue label. Built once over all samples so ids are stable across batches.
+        all_moments = sorted({(m["activity"], int(m["tr"])) for m in self.meta})
+        self.moment2id = {mom: i for i, mom in enumerate(all_moments)}
+
     def _get_h5(self):
         """Per-process cached h5 file handle (safe with DataLoader workers)."""
         pid = os.getpid()
@@ -219,6 +225,7 @@ class SimultEEG_fMRI(Dataset):
             "fmri":     torch.from_numpy(fmri_tr),                # (X, Y, Z, T_win) or (n_roi, T_win)
             "ch_names": info["channels"],                     # list[str], len = C_native
             "tr_idx":   int(tr_idx),
+            "moment_id": int(self.moment2id[(meta["activity"], int(meta["tr"]))]),  # (activity, nominal tr)
             "sub":      meta["sub"],
             "run":      meta["run"],
             "t_fmri":   float(t_fmri),
@@ -236,9 +243,11 @@ def collate_fn(batch):
     The returned 'ch_names' is the per-batch channel list (Python list of strings)
     that the encoder uses to build LaBraM's input_chans positional-embedding indices.
     """
-    # Group by (run, tr) so the K samples sharing one slot stay contiguous
-    # in the flattened batch — the contrastive loss reshape expects this.
-    batch = sorted(batch, key=lambda x: (x["run"], x["tr_idx"], x["sub"]))
+    # Group by moment_id = (activity, tr) so the K samples sharing one moment
+    # (same stimulus instant, different subjects) stay contiguous in the flattened
+    # batch — reshape(-1, K, D) in multi_positive_clip_loss then treats each moment's
+    # K subjects as a positive block.
+    batch = sorted(batch, key=lambda x: (x["moment_id"], x["sub"]))
 
     # 1. intersection of channels across the batch
     common = set(batch[0]["ch_names"])
@@ -279,99 +288,91 @@ def collate_fn(batch):
         "ch_names": common_ordered,
         "sub_id":   torch.tensor([sub_code[v]  for v in subs],  dtype=torch.long),
         "slot_id":  torch.tensor([slot_code[v] for v in slots], dtype=torch.long),
+        "moment_id": torch.tensor([s["moment_id"] for s in batch], dtype=torch.long),
     }
 
 
 class ContrastiveBatchSampler(Sampler):
     """
-    Hierarchical R x T sampler keyed by (subject, activity) blocks. Each batch:
-      - R distinct blocks, where a block is one (subject, activity) recording
-      - T margin-separated TRs from each block (all the SAME subject)
-    so total batch size = R * T = M.
+    Cross-subject multi-positive sampler. Each batch comes from ONE activity
+    (stimulus) and has shape T moments x K subjects (batch size = T * K):
 
-    Why blocks are single-subject:
-    The contrastive loss reduces its loss via whatever feature separates the
-    positive from the in-batch negatives. If the hard (high-similarity) negatives
-    were different subjects, "which subject is this" would solve matching via
-    anatomy / electrode-placement / spectral fingerprint alone — a shortcut that
-    learns no temporal alignment and stays at chance on unseen subjects.
+      - one ACTIVITY per batch -> every in-batch negative is the SAME stimulus at a
+        DIFFERENT moment (the hardest negatives). Cross-activity (easy) negatives are
+        meant to come from the memory-bank queue, not from the batch.
+      - T MOMENTS (distinct TRs of that activity), margin-separated so neighbouring,
+        autocorrelated frames are not both sampled. `margin_tr` is in TRs; with TR~2.1s
+        keep margin_tr * TR above the BOLD HRF width (~6s) to truly decorrelate.
+      - K SUBJECTS per moment, drawn from the subjects who have that (activity, tr).
+        These K form the multi-positive group: same stimulus moment, different brains.
+        The loss pulls them together -> subject-invariant, stimulus-locked features
+        (the shared neural activity), which is what generalizes to unseen subjects.
 
-    By drawing all T TRs of a block from ONE subject, each query gets T-1 in-block
-    negatives that are same-subject / different-moment. Subject identity is then
-    constant across the pool and carries no discriminative information — the model
-    can only separate them via TR-level EEG-fMRI alignment, which is the signal we
-    actually want. The (R-1) * T cross-block slots remain as easy negatives for
-    diversity.
+    A subject contributes at most one sample per moment (a random recording if it has
+    several, e.g. Run-1 / Run-2), so a same-film repeat never appears twice in a moment.
 
-    A block is keyed by (sub, act_key); the same subject doing the same act_key
-    across multiple sessions is merged (one TR index may map to several samples,
-    one is chosen at random). Each slot is a single sample — num_subjects has no
-    effect here.
+    Samples are emitted grouped by moment (K contiguous per moment); collate_fn re-sorts
+    by moment_id so reshape(-1, K, D) in multi_positive_clip_loss recovers [T, K, D] with
+    each moment's K subjects as a positive block.
 
-    `margin_tr` applies between two TRs of the same block (so the T same-subject
-    slots are temporally decorrelated). Across blocks no margin is needed — BOLD
-    signals are unrelated regardless of TR index.
+    With K=1 this degenerates to a single-activity temporal sampler (no cross-subject
+    positives) -> set num_subjects >= 2 to exercise the multi-positive structure.
+    `num_recordings` (R) from the old hierarchical sampler is no longer used.
     """
     def __init__(self, dataset: SimultEEG_fMRI, config: TrainConfig):
         self.dataset = dataset
-        self.T       = config.data.num_timestamps
-        self.R       = config.data.num_recordings
-        self.margin  = config.data.margin_tr
-        self.M       = self.R * self.T
+        self.T      = config.data.num_timestamps
+        self.K      = config.data.num_subjects
+        self.margin = config.data.margin_tr
 
-        # block (subject, activity) -> tr -> list of dataset indices
-        block_trs: dict = defaultdict(lambda: defaultdict(list))
+        # activity -> tr -> {subject -> [dataset idx, ...]}
+        act: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         for idx, meta in enumerate(self.dataset.meta):
-            block_trs[(meta['sub'], meta['run'])][meta['tr']].append(idx)
-        self.block_trs = block_trs
-        self.block_usable_trs = {
-            blk: list(trs.keys())
-            for blk, trs in block_trs.items()
-            if len(trs) >= self.T
-        }
+            act[meta["activity"]][int(meta["tr"])][meta["sub"]].append(idx)
+        self.act = act
 
-    def __iter__(self):
-        # consumable per-block TR pool — each TR drawn at most once per epoch
-        remaining = {blk: list(trs) for blk, trs in self.block_usable_trs.items()}
+        # per activity, the TRs with at least K distinct subjects (usable moments);
+        # keep only activities that can offer at least T such moments.
+        self.usable = {}
+        for a, trs in act.items():
+            good = [tr for tr, subs in trs.items() if len(subs) >= self.K]
+            if len(good) >= self.T:
+                self.usable[a] = good
+        self.activities = list(self.usable.keys())
 
-        while True:
-            eligible = [blk for blk, trs in remaining.items() if len(trs) >= self.T]
-            if len(eligible) < self.R:
-                return
-
-            random.shuffle(eligible)
-
-            batch_indices = []
-            picked = 0
-            for blk in eligible:
-                if picked == self.R:
-                    break
-
-                # greedy: pick T margin-separated TRs from this block's pool
-                pool = list(remaining[blk])
-                random.shuffle(pool)
-                picked_trs = []
-                for tr in pool:
-                    if all(abs(tr - s) >= self.margin for s in picked_trs):
-                        picked_trs.append(tr)
-                        if len(picked_trs) == self.T:
-                            break
-
-                if len(picked_trs) < self.T:
-                    continue  # margin-pack failed for this block this batch
-
-                for tr in picked_trs:
-                    remaining[blk].remove(tr)
-                    batch_indices.append(random.choice(self.block_trs[blk][tr]))
-                picked += 1
-
-            if picked < self.R:
-                return  # epoch tail — cannot fill another full batch
-
-            yield batch_indices
+        n_usable = sum(len(v) for v in self.usable.values())
+        self._len = max(1, n_usable // self.T)
 
     def __len__(self):
-        # upper-bound estimate: total usable TRs across eligible blocks, divided
-        # by M. Greedy margin-pack failures may slightly reduce actual count.
-        total = sum(len(trs) for trs in self.block_usable_trs.values())
-        return total // self.M
+        return self._len
+
+    def _pick_moments(self, trs):
+        """Greedy margin-separated pick of T TRs; None if it can't pack T."""
+        pool = list(trs)
+        random.shuffle(pool)
+        picked = []
+        for tr in pool:
+            if all(abs(tr - p) >= self.margin for p in picked):
+                picked.append(tr)
+                if len(picked) == self.T:
+                    return picked
+        return None
+
+    def __iter__(self):
+        if not self.activities:
+            return
+        for _ in range(self._len):
+            batch = None
+            # try activities in random order until one margin-packs T moments
+            for a in random.sample(self.activities, len(self.activities)):
+                picked = self._pick_moments(self.usable[a])
+                if picked is None:
+                    continue
+                batch = []
+                for tr in picked:
+                    subs = random.sample(list(self.act[a][tr].keys()), self.K)
+                    for s in subs:
+                        batch.append(random.choice(self.act[a][tr][s]))
+                break
+            if batch is not None:
+                yield batch
