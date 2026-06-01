@@ -52,8 +52,8 @@ class DataConfig:
 
     #batch sampler settings (hierarchical R x T):
     num_timestamps: int = 8 #T: TRs sampled from each recording per batch
-    num_recordings: int = 8 #R: distinct recordings per batch. Total slots per batch = R * T; forces same-recording hard negatives so the model cannot solve contrastive matching via subject identity alone.
-    num_subjects: int = 1 #K: subjects per (rec, tr) slot (multi-positive count)
+    num_recordings: int = 1 #R: distinct activities per batch. Mixes hard (same-activity) and easy (cross-activity) negatives. Total batch = R * T * K.
+    num_subjects: int = 8 #K: subjects per (rec, tr) slot (multi-positive count)
     margin_tr: int = 5 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
 @dataclass
@@ -94,9 +94,9 @@ class TrainingConfig:
     # the projectors train first, then ramp LoRA into the normal warmup→cosine.
     # 0 -> disabled (LoRA trains from step 0). Only affects the backbone optimizer;
     # the projector optimizer always warms up from step 0.
-    proj_warmup_steps: int = 0
+    proj_warmup_steps: int = 100
     num_epochs:int = 100
-    tau: float = 0.05 #for infonce loss
+    tau: float = 0.1 #for infonce loss
 
     # identity-controlled hard-negative contrastive term (see within_subject_clip_loss).
     # 0.0 -> disabled (legacy global-only InfoNCE). >0 -> add lambda * within-subject
@@ -135,11 +135,13 @@ class TrainingConfig:
     # overfit-on-one-batch sanity check: set overfit_batches=1 to repeat the same
     # batch every step; max_steps=-1 disables step limit (combine with num_epochs).
     overfit_batches: int = 0
-    max_steps: int = 5000
+    max_steps: int = 10000
     val_every_n_steps: int = 50
     limit_val_batches: int = 30  # cap validation at N batches per check (~30×64=1920 samples)
 
-    variance_weight: float = 0.3  # VICReg variance term: penalizes embedding dims with std < 1
+    variance_weight: float = 0   # VICReg variance term: penalizes embedding dims with std < 1
+    covariance_weight: float = 0  # VICReg covariance term: penalizes off-diagonal covariance (breaks single-point collapse)
+    invariance_weight: float = 0  # VICReg invariance term: sum-over-dim L2² between z_f and z_e positive pairs — non-zero gradient at collapse
 
     wandb_project: str = "shevchuk-bs-thesis"
     wandb_group: str = "new_sampler_new_loss"

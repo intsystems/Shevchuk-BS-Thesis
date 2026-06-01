@@ -12,6 +12,22 @@ def _variance_loss(z, eps=1e-4):
     std = torch.sqrt(z.var(dim=0) + eps)
     return F.relu(1.0 - std).mean()
 
+def _invariance_loss(z_f, z_e):
+    """VICReg invariance: mean over batch of squared L2 distance between matched pairs.
+    Sums over the embedding dim (NOT mean) so the gradient isn't diluted by D=128.
+    With unit-norm vectors: loss ≈ 2*(1 - cos_sim), ranging [0, 4].
+    Gradient = 2*(z_f_i - z_e_i)/B — non-zero whenever z_f_i ≠ z_e_i."""
+    return (z_f - z_e).pow(2).sum(dim=-1).mean()
+
+def _covariance_loss(z):
+    """VICReg covariance term: penalize off-diagonal entries of the embedding covariance matrix.
+    Forces different dimensions to encode different information, directly breaking single-point collapse."""
+    n, d = z.shape
+    z = z - z.mean(0)
+    cov = (z.T @ z) / (n - 1)          # [D, D]
+    off_diag = cov.pow(2).sum() - cov.diag().pow(2).sum()
+    return off_diag / d
+
 def multi_positive_clip_loss(z_f: torch.Tensor, z_e: torch.Tensor, tau=0.07):
     """
     z_f: [T, K, D], fMRI embeddings

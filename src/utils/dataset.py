@@ -323,6 +323,7 @@ class ContrastiveBatchSampler(Sampler):
         self.dataset = dataset
         self.T      = config.data.num_timestamps
         self.K      = config.data.num_subjects
+        self.R      = config.data.num_recordings
         self.margin = config.data.margin_tr
 
         # activity -> tr -> {subject -> [dataset idx, ...]}
@@ -362,17 +363,14 @@ class ContrastiveBatchSampler(Sampler):
         if not self.activities:
             return
         for _ in range(self._len):
-            batch = None
-            # try activities in random order until one margin-packs T moments
-            for a in random.sample(self.activities, len(self.activities)):
+            batch = []
+            for a in random.sample(self.activities, min(self.R, len(self.activities))):
                 picked = self._pick_moments(self.usable[a])
                 if picked is None:
                     continue
-                batch = []
                 for tr in picked:
                     subs = random.sample(list(self.act[a][tr].keys()), self.K)
                     for s in subs:
                         batch.append(random.choice(self.act[a][tr][s]))
-                break
-            if batch is not None:
+            if batch:
                 yield batch

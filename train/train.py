@@ -221,7 +221,7 @@ def main():
             every_n_epochs=config.train.save_every,
             save_last=True,
         ),
-        LearningRateMonitor(logging_interval="epoch"),
+        LearningRateMonitor(logging_interval="step"),
     ]
 
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -239,7 +239,7 @@ def main():
     # Use a fixed batch interval for validation so it triggers independently of
     # epoch boundaries — the R x T sampler may yield fewer batches than __len__
     # reports, which can confuse Lightning's epoch-end val scheduling.
-    val_every = max(50, len(train_loader)) if not config.train.overfit_batches else 10**9
+    val_every = config.train.val_every_n_steps if not config.train.overfit_batches else 10**9
 
     trainer = L.Trainer(
         max_epochs=-1,

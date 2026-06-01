@@ -14,7 +14,7 @@ class Projector(nn.Module):
             nn.GELU(),
             nn.Dropout(config.train.proj_dropout),
             nn.Linear(hidden, out),
-            nn.LayerNorm(out)
+            nn.LayerNorm(out),
         )
 
     def forward(self, x):

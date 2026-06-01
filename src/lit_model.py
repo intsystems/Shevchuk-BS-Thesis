@@ -4,7 +4,7 @@ import lightning as L
 from src.eeg_encoder import EEGAugmentor
 from src.fmri_encoder import FmriAugmentor
 from train.config import TrainConfig
-from src.utils.utils import multi_positive_clip_loss, within_subject_clip_loss, alignment_metric, effective_rank, _variance_loss
+from src.utils.utils import multi_positive_clip_loss, within_subject_clip_loss, alignment_metric, effective_rank, _variance_loss, _covariance_loss, _invariance_loss
 from peft import LoraConfig, get_peft_model
 
 class ContrastiveModel(L.LightningModule):
@@ -134,6 +134,18 @@ class ContrastiveModel(L.LightningModule):
             loss_var = _variance_loss(eeg_pred) + _variance_loss(fmri_pred)
             self.log("train/loss_var", loss_var, on_step=True, on_epoch=False)
             loss = loss + vw * loss_var
+
+        cw = self.config.train.covariance_weight
+        if cw > 0:
+            loss_cov = _covariance_loss(eeg_pred) + _covariance_loss(fmri_pred)
+            self.log("train/loss_cov", loss_cov, on_step=True, on_epoch=False)
+            loss = loss + cw * loss_cov
+
+        iw = self.config.train.invariance_weight
+        if iw > 0:
+            loss_inv = _invariance_loss(fmri_pred, eeg_pred)
+            self.log("train/loss_inv", loss_inv, on_step=True, on_epoch=False)
+            loss = loss + iw * loss_inv
 
         backbone_opt, projector_opt = self.optimizers()
         backbone_sched, projector_sched = self.lr_schedulers()
