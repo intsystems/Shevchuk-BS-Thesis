@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import random
+from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
@@ -42,13 +43,97 @@ def split_subjects(config: TrainConfig):
     return train_subs, val_subs, test_subs
 
 
-def build_loaders(config: TrainConfig):
-    train_subs, val_subs, test_subs = split_subjects(config)
-    print(f"[SPLIT] train={len(train_subs)}  val={len(val_subs)}  test={len(test_subs)}")
+def _split_temporal(full_ds, config):
+    """Within each recording, split moments into contiguous train/val/test time blocks,
+    dropping `split_gap_tr` moments at each boundary so HRF/autocorrelation doesn't leak
+    across the split. All subjects appear in every split."""
+    tr_ratio = config.train.train_ratio
+    va_ratio = config.train.val_ratio
+    gap      = config.data.split_gap_tr
 
-    train_ds = SimultEEG_fMRI(config, subjects=train_subs)
-    val_ds   = SimultEEG_fMRI(config, subjects=val_subs)
-    test_ds  = SimultEEG_fMRI(config, subjects=test_subs)
+    rows_by_pair = defaultdict(list)
+    for i, (pair_id, tr_idx) in enumerate(full_ds.index):
+        rows_by_pair[int(pair_id)].append((int(tr_idx), i))
+
+    train_idx, val_idx, test_idx = [], [], []
+    for rows in rows_by_pair.values():
+        rows.sort()                       # by tr_idx (ascending time)
+        order = [i for _, i in rows]
+        n = len(order)
+        # ratios partition the USABLE rows (total minus the two dropped gap buffers),
+        # so train+val+test ratios summing to 1 still leaves a non-empty test block.
+        usable = n - 2 * gap
+        if usable <= 0:                   # recording too short to split with a buffer
+            train_idx += order
+            continue
+        n_tr = int(usable * tr_ratio)
+        n_va = int(usable * va_ratio)
+        train_idx += order[:n_tr]
+        val_idx   += order[n_tr + gap: n_tr + gap + n_va]
+        test_idx  += order[n_tr + gap + n_va + gap:]
+    return train_idx, val_idx, test_idx
+
+
+def _split_activity(full_ds, config):
+    """Hold out whole activities (stimuli): assign each unique activity to train/val/test
+    by ratio (seeded shuffle). Tests generalization to unseen stimulus content."""
+    rng = random.Random(config.train.seed)
+    activities = sorted({m["activity"] for m in full_ds.meta})
+    rng.shuffle(activities)
+    n = len(activities)
+    n_tr = int(n * config.train.train_ratio)
+    n_va = int(n * config.train.val_ratio)
+    train_acts = set(activities[:n_tr])
+    val_acts   = set(activities[n_tr:n_tr + n_va])
+
+    train_idx, val_idx, test_idx = [], [], []
+    for i, m in enumerate(full_ds.meta):
+        a = m["activity"]
+        if a in train_acts:
+            train_idx.append(i)
+        elif a in val_acts:
+            val_idx.append(i)
+        else:
+            test_idx.append(i)
+    return train_idx, val_idx, test_idx
+
+
+def split_dataset(config: TrainConfig):
+    """Return (train_ds, val_ds, test_ds) according to config.data.split_mode.
+
+    - "subject":  hold out whole subjects (legacy; cross-subject generalization).
+    - "temporal": all subjects seen; hold out later TR blocks within each recording.
+    - "activity": all subjects seen; hold out whole activities/stimuli.
+    """
+    mode = config.data.split_mode
+    if mode == "subject":
+        train_subs, val_subs, test_subs = split_subjects(config)
+        print(f"[SPLIT subject] train={len(train_subs)} val={len(val_subs)} test={len(test_subs)}")
+        return (SimultEEG_fMRI(config, subjects=train_subs),
+                SimultEEG_fMRI(config, subjects=val_subs),
+                SimultEEG_fMRI(config, subjects=test_subs))
+
+    all_subs = [f"sub-{i:02d}" for i in range(config.data.start_sub, config.data.end_sub + 1)]
+    full_ds = SimultEEG_fMRI(config, subjects=all_subs)
+
+    if mode == "temporal":
+        train_idx, val_idx, test_idx = _split_temporal(full_ds, config)
+    elif mode == "activity":
+        train_idx, val_idx, test_idx = _split_activity(full_ds, config)
+    else:
+        raise ValueError(f"unknown split_mode {mode!r}")
+
+    n_sub_train = len({full_ds.meta[i]["sub"] for i in train_idx})
+    print(f"[SPLIT {mode}] rows train={len(train_idx)} val={len(val_idx)} test={len(test_idx)} "
+          f"| {n_sub_train} subjects in train")
+
+    return (SimultEEG_fMRI.from_subset(full_ds, train_idx),
+            SimultEEG_fMRI.from_subset(full_ds, val_idx),
+            SimultEEG_fMRI.from_subset(full_ds, test_idx))
+
+
+def build_loaders(config: TrainConfig):
+    train_ds, val_ds, test_ds = split_dataset(config)
 
     train_sampler = ContrastiveBatchSampler(train_ds, config)
     nw = config.train.num_workers

@@ -22,6 +22,14 @@ class SimultEEG_fMRI(Dataset):
         self.fmri_features_h5   = config.model.fmri_features_h5
         self.subjects            = set(subjects) if subjects is not None else None
 
+        # stable GLOBAL subject -> integer index, spanning every subject (start_sub..end_sub)
+        # regardless of which split this dataset holds. Used to index the per-subject offset
+        # embedding table, so the index must be identical across train/val/test datasets.
+        self.sub2idx = {
+            f"sub-{i:02d}": i - self.config.start_sub
+            for i in range(self.config.start_sub, self.config.end_sub + 1)
+        }
+
         # per-recording channel list: key 'sub-XX_ses-XX_task-..._run-XX'
         with open(self.config.channels_json, "r", encoding="utf-8") as f:
             self.channels_per_rec = json.load(f)
@@ -227,6 +235,7 @@ class SimultEEG_fMRI(Dataset):
             "tr_idx":   int(tr_idx),
             "moment_id": int(self.moment2id[(meta["activity"], int(meta["tr"]))]),  # (activity, nominal tr)
             "sub":      meta["sub"],
+            "sub_idx":  int(self.sub2idx[meta["sub"]]),   # global subject index for offset table
             "run":      meta["run"],
             "t_fmri":   float(t_fmri),
             "ts_eeg":   float(ts_eeg[0]),
@@ -288,6 +297,7 @@ def collate_fn(batch):
         "ch_names": common_ordered,
         "sub_id":   torch.tensor([sub_code[v]  for v in subs],  dtype=torch.long),
         "slot_id":  torch.tensor([slot_code[v] for v in slots], dtype=torch.long),
+        "sub_idx":  torch.tensor([s["sub_idx"] for s in batch], dtype=torch.long),
         "moment_id": torch.tensor([s["moment_id"] for s in batch], dtype=torch.long),
     }
 

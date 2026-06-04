@@ -53,6 +53,19 @@ class ContrastiveModel(L.LightningModule):
         self.eeg_augmentor = EEGAugmentor(config)
         self.fmri_augmentor = FmriAugmentor(config)
 
+        # per-subject offset embeddings: a learnable vector subtracted from each modality's
+        # backbone features before the projector (subject-conditional encoding). Zero-init
+        # so the initial forward is identical to the no-offset baseline (like LoRA B).
+        # Requires every subject to be seen in training (split_mode != "subject").
+        if config.train.use_subject_offset:
+            n_sub = config.data.end_sub - config.data.start_sub + 1
+            self.subj_off_eeg  = torch.nn.Embedding(n_sub, config.model.Labram_out_dim)
+            self.subj_off_fmri = torch.nn.Embedding(n_sub, config.model.Neurostorm_out_dim)
+            torch.nn.init.zeros_(self.subj_off_eeg.weight)
+            torch.nn.init.zeros_(self.subj_off_fmri.weight)
+        else:
+            self.subj_off_eeg = self.subj_off_fmri = None
+
         # buffers for accumulating val embeddings across batches
         self._val_eeg, self._val_fmri, self._val_subs = [], [], []
 
@@ -60,15 +73,29 @@ class ContrastiveModel(L.LightningModule):
         x2 = x2.unsqueeze(1) #shape will be (B, 1, X, Y, Z, T)
         return self._encode_eeg(x1), self.fmri_encoder(x2)
 
-    def _encode_eeg(self, eeg: torch.Tensor, ch_names=None) -> torch.Tensor:
+    def _eeg_offset(self, sub_idx):
+        """Per-subject EEG offset (B, Labram_out_dim) or None when disabled."""
+        if self.subj_off_eeg is None or sub_idx is None:
+            return None
+        return self.subj_off_eeg(sub_idx)
+
+    def _fmri_offset(self, sub_idx):
+        """Per-subject fMRI offset (B, Neurostorm_out_dim) or None when disabled."""
+        if self.subj_off_fmri is None or sub_idx is None:
+            return None
+        return self.subj_off_fmri(sub_idx)
+
+    def _encode_eeg(self, eeg: torch.Tensor, ch_names=None, sub_idx=None) -> torch.Tensor:
         """
         eeg: (B, C, T) with single HRF shift, or (B, n_shifts, C, T) with multiple.
         For multiple shifts: encode each shift sequentially to avoid n_shifts × memory spike,
         then average embeddings to get an HRF-robust representation.
+        sub_idx: optional (B,) global subject indices for the per-subject offset.
         """
+        off = self._eeg_offset(sub_idx)
         if eeg.dim() == 3:
-            return self.eeg_encoder(eeg, ch_names=ch_names)
-        embs = [self.eeg_encoder(eeg[:, i], ch_names=ch_names) for i in range(eeg.size(1))]
+            return self.eeg_encoder(eeg, ch_names=ch_names, sub_offset=off)
+        embs = [self.eeg_encoder(eeg[:, i], ch_names=ch_names, sub_offset=off) for i in range(eeg.size(1))]
         return torch.stack(embs, dim=1).mean(dim=1)    # (B, D)
         
     def on_after_batch_transfer(self, batch, batch_idx):
@@ -76,6 +103,7 @@ class ContrastiveModel(L.LightningModule):
         ch_names  = batch.get("ch_names")   # carried through as Python list (collate keeps it)
         sub_id    = batch.get("sub_id")     # [B] long, for the identity-controlled loss term
         slot_id   = batch.get("slot_id")    # [B] long, task-moment grouping
+        sub_idx   = batch.get("sub_idx")    # [B] long, GLOBAL subject index for offset table
 
         # fMRI is kept as float16 through CPU/worker pipeline to halve memory; cast here on GPU.
         fmri = fmri.float()
@@ -86,7 +114,7 @@ class ContrastiveModel(L.LightningModule):
 
         if not self.training or not self.config.train.using_aug:
             return {"eeg": eeg, "fmri": fmri, "ch_names": ch_names,
-                    "sub_id": sub_id, "slot_id": slot_id}
+                    "sub_id": sub_id, "slot_id": slot_id, "sub_idx": sub_idx}
 
         # EEGAugmentor expects (B, C, T). For multi-HRF input (B, K_hrf, C, T)
         # fold K_hrf into batch so each shift is independently augmented, then
@@ -98,14 +126,15 @@ class ContrastiveModel(L.LightningModule):
             eeg_aug = self.eeg_augmentor(eeg)
         fmri_aug = self.fmri_augmentor(fmri)
         return {"eeg": eeg_aug, "fmri": fmri_aug, "ch_names": ch_names,
-                "sub_id": sub_id, "slot_id": slot_id}
+                "sub_id": sub_id, "slot_id": slot_id, "sub_idx": sub_idx}
 
     def training_step(self, batch, batch_idx):
         eeg, fmri = batch["eeg"], batch["fmri"]
         ch_names  = batch.get("ch_names")
+        sub_idx   = batch.get("sub_idx")
 
-        eeg_pred  = self._encode_eeg(eeg, ch_names=ch_names)
-        fmri_pred = self.fmri_encoder(fmri)
+        eeg_pred  = self._encode_eeg(eeg, ch_names=ch_names, sub_idx=sub_idx)
+        fmri_pred = self.fmri_encoder(fmri, sub_offset=self._fmri_offset(sub_idx))
 
         K = self.config.data.num_subjects
         D = eeg_pred.shape[-1]
@@ -153,10 +182,14 @@ class ContrastiveModel(L.LightningModule):
         projector_opt.zero_grad()
         self.manual_backward(loss)
 
-        lora_grads = [p.grad for n, p in self.named_parameters() if "projector" not in n and p.requires_grad and p.grad is not None]
+        lora_grads = [p.grad for n, p in self.named_parameters() if "projector" not in n and "subj_off" not in n and p.requires_grad and p.grad is not None]
         proj_grads = [p.grad for n, p in self.named_parameters() if "projector" in n and p.requires_grad and p.grad is not None]
+        subj_grads = [p.grad for n, p in self.named_parameters() if "subj_off" in n and p.requires_grad and p.grad is not None]
         lora_norm = torch.stack([g.norm(2) for g in lora_grads]).norm(2) if lora_grads else torch.zeros(1, device=self.device)
         proj_norm = torch.stack([g.norm(2) for g in proj_grads]).norm(2) if proj_grads else torch.zeros(1, device=self.device)
+        if subj_grads:
+            subj_norm = torch.stack([g.norm(2) for g in subj_grads]).norm(2)
+            self.log("train/subj_off_grad_norm", subj_norm, on_step=True, on_epoch=False)
 
         trainable = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=self.config.train.grad_clip_val)
@@ -240,8 +273,9 @@ class ContrastiveModel(L.LightningModule):
         with open("val_debug.log", "a") as f:
             f.write(f"  step {batch_idx} eeg={tuple(batch['eeg'].shape)}\n")
 
-        eeg_pred  = self._encode_eeg(batch["eeg"], ch_names=batch.get("ch_names"))
-        fmri_pred = self.fmri_encoder(batch["fmri"])
+        sub_idx   = batch.get("sub_idx")
+        eeg_pred  = self._encode_eeg(batch["eeg"], ch_names=batch.get("ch_names"), sub_idx=sub_idx)
+        fmri_pred = self.fmri_encoder(batch["fmri"], sub_offset=self._fmri_offset(sub_idx))
         # store on CPU to avoid filling GPU memory during long val epochs
         self._val_eeg.append(eeg_pred.detach())
         self._val_fmri.append(fmri_pred.detach())
@@ -335,7 +369,9 @@ class ContrastiveModel(L.LightningModule):
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if "projector" in name:
+            # subject offset tables train alongside the projector (close to the loss,
+            # no LP-FT zero phase); the backbone optimizer holds LoRA only.
+            if "projector" in name or "subj_off" in name:
                 projector_params.append(p)
             else:
                 backbone_params.append(p)

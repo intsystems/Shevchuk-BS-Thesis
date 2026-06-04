@@ -148,15 +148,20 @@ class FMRIProjectionHead(nn.Module):
 
         self.mlp = Projector(config, in_dim=config.model.Neurostorm_out_dim)
 
-    def forward(self, x):
+    def forward(self, x, sub_offset=None):
         """
         Input: (B, 288, 2, 2, 2, T)
+        sub_offset: optional (B, Neurostorm_out_dim) per-subject offset subtracted from
+            the pooled features before projection (subject-conditional encoding).
         """
         # Take the last TR (closest to HRF peak) and pool spatially only.
         # Mean over all T blurs distinct brain states across the 8-TR window;
         # a single TR gives a specific snapshot that pairs cleanly with the EEG window.
         x_pooled = x[..., -1].mean(dim=(2, 3, 4))  # (B, 288)
-        
+
+        if sub_offset is not None:
+            x_pooled = x_pooled - sub_offset
+
         # 2. Проекция в общее пространство
         return self.mlp(x_pooled)
 
@@ -182,16 +187,18 @@ class FMRIEncoderVolume(nn.Module):
         self.backbone = _load_neurostorm_backbone(config.model.Neurostorm_ckpt, freeze=config.train.freeze_backbone)
         self.projector = FMRIProjectionHead(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sub_offset=None) -> torch.Tensor:
         """
         x: (B, X, Y, Z, T)  — dataset/augmentor format
         NeuroSTORM expects (B, 1, X, Y, Z, T): add the singleton channel dim.
         Projector (FMRIProjectionHead) handles the spatiotemporal pooling.
+        sub_offset: optional (B, Neurostorm_out_dim) per-subject offset subtracted from
+            the pooled features before projection (subject-conditional encoding).
         """
         if x.dim() == 5:
             x = x.unsqueeze(1)                          # (B, 1, X, Y, Z, T)
         latent, _ = self.backbone.forward_encoder(x)   # (B, 288, 2, 2, 2, T)
-        return self.projector(latent)                   # (B, proj_out_dim)
+        return self.projector(latent, sub_offset=sub_offset)  # (B, proj_out_dim)
 
     def train(self, mode: bool = True):
         super().train(mode)

@@ -170,10 +170,12 @@ class EEGEncoder(nn.Module):
             self._input_chans_cache[key] = torch.tensor([0] + idx, dtype=torch.long)
         return self._input_chans_cache[key].to(device)
 
-    def forward(self, x: torch.Tensor, ch_names=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ch_names=None, sub_offset=None) -> torch.Tensor:
         """
         x: (B, C, T) — channels in some consistent order across the batch
         ch_names: list of channel name strings, length C. Required.
+        sub_offset: optional (B, Labram_out_dim) per-subject offset subtracted from the
+            backbone CLS features before projection (subject-conditional encoding).
         returns: (B, proj_out_dim)
         """
         if ch_names is None:
@@ -182,6 +184,8 @@ class EEGEncoder(nn.Module):
         cls = self.backbone.forward_features(x, input_chans=input_chans)
         if cls.dim() == 3:                # safety: (B, num_tokens, D) → take CLS
             cls = cls[:, 0]
+        if sub_offset is not None:
+            cls = cls - sub_offset
         return self.projector(cls)
 
     def train(self, mode: bool = True):

@@ -56,6 +56,15 @@ class DataConfig:
     num_subjects: int = 8 #K: subjects per (rec, tr) slot (multi-positive count)
     margin_tr: int = 5 #minimal fMRI frames between two TRs of the SAME recording in one batch
 
+    # train/val/test split axis. "subject" = hold out whole subjects (legacy; tests
+    # cross-subject generalization). "temporal" = all subjects seen, hold out later
+    # contiguous TR blocks within each recording (tests unseen moments). "activity" =
+    # all subjects seen, hold out whole recordings/activities (tests unseen stimulus).
+    split_mode: str = "temporal"
+    # temporal split only: drop this many TRs at each train/val/test boundary as a
+    # buffer so HRF/autocorrelation doesn't leak across the split.
+    split_gap_tr: int = 5
+
 @dataclass
 class ModelConfig:
     #models params
@@ -104,6 +113,11 @@ class TrainingConfig:
     # removing the subject-identity shortcut. Start with ~1.0 for an A/B run.
     within_subject_weight: float = 0.1
 
+    # per-subject offset embeddings: a learnable vector subtracted from each modality's
+    # backbone features before the projector, letting the model absorb subject-specific
+    # feature shifts. Requires all subjects to be seen in training (split_mode != "subject").
+    use_subject_offset: bool = True
+
     freeze_backbone: bool = True
 
     #lora params
@@ -111,7 +125,7 @@ class TrainingConfig:
     eeg_lora_alpha: float = 16
     fmri_lora_rank: int = 16
     fmri_lora_alpha: float = 16
-    lora_dropout: float = 0.0
+    lora_dropout: float = 0.2
 
     #data
     train_ratio: float = 0.8
