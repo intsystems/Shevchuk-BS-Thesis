@@ -1,5 +1,5 @@
 """
-Within-recording block permutation test (Ojala & Garriga 2010 style).
+Within-recording block circular-shift permutation test.
 
 For each (subject, recording) block in the val set, compute the n×n cosine-similarity
 matrix between normalized fMRI and EEG embeddings. The diagonal entries are matched
@@ -8,14 +8,25 @@ positive pairs; off-diagonal are negatives.
 Test statistic:
   t = mean(all positive sims across blocks) - mean(all negative sims across blocks)
 
-Null distribution: independently shuffle the EEG window order WITHIN each block,
-preserving the block's autocorrelation structure while breaking the EEG↔fMRI pairing.
+Null distribution — circular (phase) shift, NOT random shuffle:
+  For each block, the entire EEG sequence is shifted forward by a random integer
+  offset Δt drawn from [MIN_SHIFT, n-1], wrapping around at the boundary:
 
-Efficiency: similarity matrices are precomputed once. Each permutation only needs
-  S[arange(n), random_perm].sum()   (O(n) per block, O(N_total) per permutation)
-because S.sum() is invariant under column permutation.
+    fMRI: [f_0, f_1, ..., f_{n-1}]          (unchanged)
+    EEG:  [e_{Δt}, e_{Δt+1}, ..., e_{n-1}, e_0, ..., e_{Δt-1}]
 
-p-value = (count(t_perm ≥ t_obs) + 1) / (K + 1)
+  This preserves the full temporal autocorrelation of EEG while breaking its
+  alignment with fMRI.  Random shuffling would convert EEG into white noise and
+  produce a straw-man null biased toward false significance (Type I inflation).
+
+  MIN_SHIFT excludes very small offsets where residual HRF/autocorrelation overlap
+  could still inflate similarity even after breaking the exact pairing.
+
+Efficiency: similarity matrices are precomputed once.  A circular shift of the EEG
+columns by Δt maps diagonal entry i to S[i, (i+Δt) % n], so each shift costs O(n)
+per block — O(N_total) per permutation — and S.sum() is unchanged (column permutation).
+
+p-value = (count(t_shift ≥ t_obs) + 1) / (K + 1)
 """
 
 import sys
@@ -33,12 +44,16 @@ from train.train import build_model, split_dataset
 
 
 # ── config ────────────────────────────────────────────────────────────────────
-CKPT = "checkpoints/epoch=epoch=09-mrr=val/mrr_e2f=0.0303.ckpt"
+CKPT = "model.ckpt"
 K    = 5000
-BATCH   = 64
+BATCH     = 64
 N_WORKERS = 0    # 0 avoids multiprocessing issues with h5py file handles
-DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-SEED    = 42
+DEVICE    = "cuda" if torch.cuda.is_available() else "cpu"
+SEED      = 42
+# Minimum circular shift in TRs. Excludes offsets where autocorrelation overlap
+# between shifted EEG and intact fMRI could still be non-negligible.
+# Rule of thumb: ≥ HRF_peak/TR + eeg_win/TR ≈ (6+15)/2.1 ≈ 10 TRs.
+MIN_SHIFT = 10
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -164,16 +179,23 @@ def observed_stat(sim_mats, row_indices, totals, ns):
     return pos_sum / pos_count - neg_sum / neg_count, pos_count, neg_count
 
 
-def permuted_stat(sim_mats, row_indices, totals, ns, rng, total_all, pos_count, neg_count):
-    """One permutation: shuffle EEG columns within each block → O(N_total)."""
-    perm_pos = 0.0
+def shifted_stat(sim_mats, row_indices, totals, ns, rng, total_all, pos_count, neg_count):
+    """One circular-shift permutation: shift EEG columns by random Δt per block → O(N_total).
+
+    For block with n windows, Δt is drawn uniformly from [min_shift, n-1] where
+    min_shift = min(MIN_SHIFT, n-1) to handle small blocks gracefully.
+    Positive sim after shift k: S[i, (i+k) % n]  →  S[ridx, (ridx+k) % n].sum()
+    S.sum() is invariant under any column permutation, so neg sum = total_all - pos_sum.
+    """
+    shift_pos = 0.0
     for S, ridx, n in zip(sim_mats, row_indices, ns):
         if S is None:
             continue
-        col_perm = rng.permutation(n)
-        perm_pos += S[ridx, col_perm].sum()
-    perm_neg = total_all - perm_pos
-    return perm_pos / pos_count - perm_neg / neg_count
+        lo = min(MIN_SHIFT, n - 1)
+        k = int(rng.integers(lo, n))          # Δt ∈ [lo, n-1]
+        shift_pos += S[ridx, (ridx + k) % n].sum()
+    shift_neg = total_all - shift_pos
+    return shift_pos / pos_count - shift_neg / neg_count
 
 
 def main():
@@ -196,8 +218,20 @@ def main():
     _, val_ds, _ = split_dataset(config)
     print(f"[INFO] val_ds size = {len(val_ds)}")
 
-    print("[INFO] encoding val set …")
-    z_e, z_f, subs, runs = encode_val(model, val_ds, DEVICE, BATCH)
+    cache_path = CKPT.replace(".ckpt", "_val_emb.npz")
+    if os.path.exists(cache_path):
+        print(f"[INFO] loading cached embeddings from {cache_path} …")
+        cache = np.load(cache_path, allow_pickle=False)
+        z_e   = cache["z_e"]
+        z_f   = cache["z_f"]
+        subs  = cache["subs"].tolist()
+        runs  = cache["runs"].tolist()
+    else:
+        print("[INFO] encoding val set …")
+        z_e, z_f, subs, runs = encode_val(model, val_ds, DEVICE, BATCH)
+        np.savez(cache_path, z_e=z_e, z_f=z_f,
+                 subs=np.array(subs), runs=np.array(runs))
+        print(f"[INFO] embeddings cached to {cache_path}")
     print(f"[INFO] encoded {len(z_e)} samples into {z_e.shape[1]}-d embeddings")
 
     blocks = build_blocks(z_e, z_f, subs, runs)
@@ -220,13 +254,15 @@ def main():
     # ── permutation loop ──────────────────────────────────────────────────────
     rng = np.random.default_rng(SEED)
     count_extreme = 0
+    null_values = np.empty(K, dtype=np.float64)
 
-    print(f"\n[INFO] running {K} within-block permutations …")
+    print(f"\n[INFO] running {K} within-block circular-shift permutations (MIN_SHIFT={MIN_SHIFT}) …")
     for k in range(K):
-        t_perm = permuted_stat(
+        t_perm = shifted_stat(
             sim_mats, row_indices, totals, ns, rng,
             total_all, pos_count, neg_count
         )
+        null_values[k] = t_perm
         if t_perm >= t_obs:
             count_extreme += 1
 
@@ -236,8 +272,21 @@ def main():
 
     p_val = (count_extreme + 1) / (K + 1)
 
+    # ── null distribution diagnostics ─────────────────────────────────────────
+    null_mean = null_values.mean()
+    null_std  = null_values.std()
+    null_max  = null_values.max()
+    z_score   = (t_obs - null_mean) / null_std if null_std > 0 else float("inf")
+
     print(f"\n{'='*60}")
     print(f"  t_obs                  = {t_obs:.6f}")
+    print(f"  null mean ± std        = {null_mean:.6f} ± {null_std:.6f}")
+    print(f"  null max               = {null_max:.6f}")
+    print(f"  null percentiles       = "
+          f"p50={np.percentile(null_values, 50):.6f}  "
+          f"p95={np.percentile(null_values, 95):.6f}  "
+          f"p99={np.percentile(null_values, 99):.6f}")
+    print(f"  z-score (t_obs)        = {z_score:.2f}σ above null mean")
     print(f"  K permutations         = {K}")
     print(f"  count(t_perm ≥ t_obs)  = {count_extreme}")
     print(f"  p-value                = {p_val:.4f}")
@@ -251,6 +300,11 @@ def main():
         verdict = f"p = {p_val:.4f} — NOT significant (no detectable temporal alignment)"
     print(f"  VERDICT: {verdict}")
     print(f"{'='*60}\n")
+
+    null_path = CKPT.replace(".ckpt", "_null_dist.npy")
+    np.save(null_path, null_values)
+    print(f"[INFO] null distribution saved to {null_path}  "
+          f"(load with np.load to plot histogram)")
 
 
 if __name__ == "__main__":
