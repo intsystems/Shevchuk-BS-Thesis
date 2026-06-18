@@ -36,6 +36,7 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from train.config import TrainConfig
 from train.train import build_model
@@ -49,6 +50,8 @@ ACT_ALIGN  = sys.argv[3] if len(sys.argv) > 3 else None   # e.g. "task-dme"; Non
 ACT_OTHER  = sys.argv[4] if len(sys.argv) > 4 else None   # different activity; None -> auto
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 ENC_BATCH  = 32
+PROJ       = "tsne"   # "tsne" | "pca"
+TSNE_PERP  = 30
 OUT_PATH   = "eeg_fmri_trajectories.png"
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -128,12 +131,24 @@ def pick_recordings(ds):
     return subject, act_align, act_other, pid_align, pid_other
 
 
+def _project(A, B):
+    """Return 2-D projections of A and B using the method set by PROJ."""
+    combined = np.vstack([A, B])
+    if PROJ == "tsne":
+        perp = min(TSNE_PERP, (len(combined) - 1) // 3)
+        coords = TSNE(n_components=2, perplexity=perp, random_state=42,
+                      n_iter=1000).fit_transform(combined)
+    else:
+        pca = PCA(n_components=2).fit(combined)
+        coords = pca.transform(combined)
+    return coords[:len(A)], coords[len(A):]
+
+
 def plot_pca_traj(ax, A, B, labels, title):
-    """2D PCA of two trajectories A, B [n, D]; colour = window index, draw paths +
+    """2-D projection of two trajectories A, B [n, D]; colour = window index, draw paths +
     window-by-window connectors between the matched prefix."""
     n = min(len(A), len(B))
-    pca = PCA(n_components=2).fit(np.vstack([A, B]))
-    a2, b2 = pca.transform(A), pca.transform(B)
+    a2, b2 = _project(A, B)
 
     ta, tb = np.arange(len(A)), np.arange(len(B))
     ax.plot(a2[:, 0], a2[:, 1], "-", color="0.7", lw=0.6, zorder=1)
@@ -147,7 +162,8 @@ def plot_pca_traj(ax, A, B, labels, title):
     ax.scatter(b2[:, 0], b2[:, 1], c=tb, cmap="Oranges", s=18, marker="^",
                edgecolor="k", linewidth=0.2, zorder=2, label=labels[1])
     ax.set_title(title, fontsize=10)
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    lbl = "t-SNE" if PROJ == "tsne" else "PCA"
+    ax.set_xlabel(f"{lbl}-1"); ax.set_ylabel(f"{lbl}-2")
     ax.legend(fontsize=8, loc="best")
     return sa
 
