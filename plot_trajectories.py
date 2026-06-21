@@ -44,7 +44,7 @@ from src.utils.dataset import SimultEEG_fMRI, collate_fn
 
 
 # ── config / CLI ────────────────────────────────────────────────────────────────
-CKPT       = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/last.ckpt"
+CKPT       = sys.argv[1] if len(sys.argv) > 1 else "model.ckpt"
 SUBJECT    = sys.argv[2] if len(sys.argv) > 2 else None   # e.g. "sub-03"; None -> auto
 ACT_ALIGN  = sys.argv[3] if len(sys.argv) > 3 else None   # e.g. "task-dme"; None -> auto
 ACT_OTHER  = sys.argv[4] if len(sys.argv) > 4 else None   # different activity; None -> auto
@@ -53,7 +53,7 @@ ENC_BATCH  = 32
 PROJ       = "pca"    # "pca" preserves temporal drift; "tsne" shows cluster separation
 TSNE_PERP  = 30
 DRAW_TRAJ  = True     # overlay a smoothed temporal path on the scatter
-SMOOTH_WIN = 20       # moving-average window (TRs) for the smoothed trajectory spine
+SMOOTH_WIN = 20      # moving-average window (TRs) for the smoothed trajectory spine
 OUT_PATH   = "eeg_fmri_trajectories.png"
 # ────────────────────────────────────────────────────────────────────────────────
 

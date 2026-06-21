@@ -44,7 +44,7 @@ from train.train import build_model, split_dataset
 
 
 # ── config ────────────────────────────────────────────────────────────────────
-CKPT = "checkpoints/epoch=epoch=09-mrr=val/mrr_e2f=0.0303.ckpt"
+CKPT = "model.ckpt"
 K    = 5000
 BATCH     = 64
 N_WORKERS = 0    # 0 avoids multiprocessing issues with h5py file handles
