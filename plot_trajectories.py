@@ -50,8 +50,10 @@ ACT_ALIGN  = sys.argv[3] if len(sys.argv) > 3 else None   # e.g. "task-dme"; Non
 ACT_OTHER  = sys.argv[4] if len(sys.argv) > 4 else None   # different activity; None -> auto
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 ENC_BATCH  = 32
-PROJ       = "tsne"   # "tsne" | "pca"
+PROJ       = "pca"    # "pca" preserves temporal drift; "tsne" shows cluster separation
 TSNE_PERP  = 30
+DRAW_TRAJ  = True     # overlay a smoothed temporal path on the scatter
+SMOOTH_WIN = 20       # moving-average window (TRs) for the smoothed trajectory spine
 OUT_PATH   = "eeg_fmri_trajectories.png"
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -97,136 +99,243 @@ def encode_recording(model, ds, pair_id):
     return torch.cat(ze_all).numpy(), torch.cat(zf_all).numpy()
 
 
-def pick_recordings(ds):
-    """Auto-select (subject, pair_id_aligned, pair_id_other) honouring any CLI overrides."""
-    by_sub = defaultdict(list)                         # sub -> [(pair_id, activity), ...]
+def pick_subject(ds):
+    """Return (subject_id, [(pair_id, activity), ...]) for the chosen subject."""
+    by_sub = defaultdict(list)
     for pid, p in enumerate(ds.pairs):
         by_sub[p["sub"]].append((pid, p["activity"]))
 
-    # subject: CLI override, else first subject that has >= 2 distinct activities
     if SUBJECT is not None:
-        subject = SUBJECT
-    else:
-        subject = next((s for s, rec in by_sub.items()
-                        if len({a for _, a in rec}) >= 2), None)
-    if subject is None or subject not in by_sub:
-        raise SystemExit(f"no usable subject (asked for {SUBJECT!r}); "
-                         f"available: {sorted(by_sub)}")
-    recs = by_sub[subject]
+        if SUBJECT not in by_sub:
+            raise SystemExit(f"subject {SUBJECT!r} not found; "
+                             f"available: {sorted(by_sub)}")
+        return SUBJECT, by_sub[SUBJECT]
 
-    def find(activity):
-        return next((pid for pid, a in recs if a == activity), None)
-
-    acts = sorted({a for _, a in recs})
-    act_align = ACT_ALIGN or acts[0]
-    act_other = ACT_OTHER or next((a for a in acts if a != act_align), None)
-    pid_align = find(act_align)
-    pid_other = find(act_other)
-    if pid_align is None or pid_other is None or pid_align == pid_other:
-        raise SystemExit(f"subject {subject}: need two different activities; "
-                         f"has {acts}")
-    print(f"[INFO] subject={subject}  aligned={act_other!r}->{act_align!r}")
-    print(f"[INFO]   aligned  recording = {ds.pairs[pid_align]['h5_grp']}")
-    print(f"[INFO]   other    recording = {ds.pairs[pid_other]['h5_grp']}")
-    return subject, act_align, act_other, pid_align, pid_other
+    subject = next((s for s, rec in sorted(by_sub.items())
+                    if len({a for _, a in rec}) >= 2), None)
+    if subject is None:
+        raise SystemExit("no subject with >= 2 distinct activities found")
+    return subject, by_sub[subject]
 
 
-def _project(A, B):
-    """Return 2-D projections of A and B using the method set by PROJ."""
-    combined = np.vstack([A, B])
+def encode_subject_recordings(model, ds, recordings):
+    """Encode every (pair_id, activity) for one subject.
+
+    Returns ze [N, D], zf [N, D] and a parallel list of activity labels.
+    Windows within each activity are in temporal (TR) order.
+    """
+    ze_parts, zf_parts, labels = [], [], []
+    for pid, activity in recordings:
+        print(f"  [INFO]   {activity}  (pair_id={pid})")
+        ze, zf = encode_recording(model, ds, pid)
+        ze_parts.append(ze)
+        zf_parts.append(zf)
+        labels.extend([activity] * len(ze))
+    return np.vstack(ze_parts), np.vstack(zf_parts), labels
+
+
+def _project_all(combined):
+    """2-D projection of combined [N, D] using PROJ method."""
     if PROJ == "tsne":
         perp = min(TSNE_PERP, (len(combined) - 1) // 3)
-        coords = TSNE(n_components=2, perplexity=perp, random_state=42,
-                      n_iter=1000).fit_transform(combined)
-    else:
-        pca = PCA(n_components=2).fit(combined)
-        coords = pca.transform(combined)
-    return coords[:len(A)], coords[len(A):]
+        print(f"[INFO] running t-SNE on {len(combined)} points (perplexity={perp}) …")
+        return TSNE(n_components=2, perplexity=perp, random_state=42,
+                    max_iter=1000).fit_transform(combined)
+    print(f"[INFO] running PCA on {len(combined)} points …")
+    return PCA(n_components=2, random_state=42).fit_transform(combined)
 
 
-def plot_pca_traj(ax, A, B, labels, title):
-    """2-D projection of two trajectories A, B [n, D]; colour = window index, draw paths +
-    window-by-window connectors between the matched prefix."""
-    n = min(len(A), len(B))
-    a2, b2 = _project(A, B)
+def plot_subject_tsne(ax, ze_all, zf_all, act_labels, subject):
+    """2-D projection of all EEG and fMRI embeddings for one subject.
 
-    ta, tb = np.arange(len(A)), np.arange(len(B))
-    ax.plot(a2[:, 0], a2[:, 1], "-", color="0.7", lw=0.6, zorder=1)
-    ax.plot(b2[:, 0], b2[:, 1], "-", color="0.7", lw=0.6, zorder=1)
-    # window-by-window connectors over the matched prefix
-    for t in range(n):
-        ax.plot([a2[t, 0], b2[t, 0]], [a2[t, 1], b2[t, 1]],
-                color="0.85", lw=0.4, zorder=0)
-    sa = ax.scatter(a2[:, 0], a2[:, 1], c=ta, cmap="Blues", s=18,
-                    edgecolor="k", linewidth=0.2, zorder=2, label=labels[0])
-    ax.scatter(b2[:, 0], b2[:, 1], c=tb, cmap="Oranges", s=18, marker="^",
-               edgecolor="k", linewidth=0.2, zorder=2, label=labels[1])
+    Colour = activity, shape = modality (○ EEG, △ fMRI).
+    DRAW_TRAJ=True draws a temporal path line through each activity's EEG embeddings
+    in window order, making time visible as spatial direction (works best with PCA).
+    """
+    activities = sorted(set(act_labels))
+    palette = plt.cm.tab10(np.linspace(0, 0.9, len(activities)))
+    act2c = {a: palette[i] for i, a in enumerate(activities)}
+    act_arr = np.array(act_labels)
+
+    combined = np.vstack([ze_all, zf_all])
+    coords = _project_all(combined)
+    ze_2d = coords[:len(ze_all)]
+    zf_2d = coords[len(ze_all):]
+
+    for act in activities:
+        mask = act_arr == act
+        c = act2c[act]
+
+        if DRAW_TRAJ:
+            pts = ze_2d[mask]
+            n = len(pts)
+            if n > SMOOTH_WIN:
+                w = min(SMOOTH_WIN, n)
+                kernel = np.ones(w) / w
+                smooth = np.stack([np.convolve(pts[:, d], kernel, mode="same")
+                                   for d in range(2)], axis=1)[w // 2: n - w // 2]
+                ax.plot(smooth[:, 0], smooth[:, 1], "-", color=c,
+                        lw=2.0, alpha=0.75, zorder=3)
+                ax.scatter(smooth[0, 0],  smooth[0, 1],  s=70, color=c,
+                           marker=">", zorder=5, edgecolor="k", linewidth=0.4)
+                ax.scatter(smooth[-1, 0], smooth[-1, 1], s=70, color=c,
+                           marker="s", zorder=5, edgecolor="k", linewidth=0.4)
+
+        ax.scatter(ze_2d[mask, 0], ze_2d[mask, 1], s=16, color=c,
+                   alpha=0.7, marker="o", edgecolor="none", zorder=2)
+        ax.scatter(zf_2d[mask, 0], zf_2d[mask, 1], s=16, color=c,
+                   alpha=0.7, marker="^", edgecolor="none", zorder=2)
+
+    act_handles = [
+        plt.Line2D([0], [0], color=act2c[a], marker="o", ls="none",
+                   markersize=7, label=a)
+        for a in activities
+    ]
+    shape_handles = [
+        plt.Line2D([0], [0], color="0.3", marker="o", ls="none",
+                   markersize=7, label="EEG  ○"),
+        plt.Line2D([0], [0], color="0.3", marker="^", ls="none",
+                   markersize=7, label="fMRI △"),
+    ]
+    ax.legend(handles=act_handles + shape_handles, fontsize=8,
+              loc="best", ncol=2, framealpha=0.8)
+    method = PROJ.upper()
+    ax.set_title(f"{method} — {subject} — all activities  (○ EEG, △ fMRI)", fontsize=11)
+    ax.set_xlabel(f"{method}-1")
+    ax.set_ylabel(f"{method}-2")
+
+
+def plot_traj_panel(ax, embed_list, labels, cmaps, title):
+    """PCA projection of one or more temporal trajectories onto a single axis.
+
+    embed_list : list of (n_i, D) arrays, each in temporal (TR) order
+    labels     : display name for each trajectory
+    cmaps      : matplotlib colormap name per trajectory (time → colour)
+
+    All trajectories are projected jointly so their positions are comparable.
+    Each trajectory gets a path line and a midpoint direction arrow (if DRAW_TRAJ).
+    """
+    combined = np.vstack(embed_list)
+    pca = PCA(n_components=2).fit(combined)
+    coords = [pca.transform(e) for e in embed_list]
+
+    handles = []
+    for pts, label, cmap in zip(coords, labels, cmaps):
+        n = len(pts)
+        w = min(SMOOTH_WIN, n)
+        kernel = np.ones(w) / w
+        smooth = np.stack([np.convolve(pts[:, d], kernel, mode="same")
+                           for d in range(2)], axis=1)[w // 2: n - w // 2]
+
+        # colour the line by time using a multicoloured LineCollection
+        from matplotlib.collections import LineCollection
+        segs = np.stack([smooth[:-1], smooth[1:]], axis=1)
+        cmap_obj = plt.get_cmap(cmap)
+        t_norm = np.linspace(0, 1, len(segs))
+        lc = LineCollection(segs, cmap=cmap, linewidth=2.5, alpha=0.9, zorder=3)
+        lc.set_array(t_norm)
+        ax.add_collection(lc)
+
+        c_start = cmap_obj(0.2)
+        c_end   = cmap_obj(0.85)
+        ax.scatter(smooth[0, 0],  smooth[0, 1],  s=100, color=c_start,
+                   marker=">", zorder=5, edgecolor="k", linewidth=0.6)
+        ax.scatter(smooth[-1, 0], smooth[-1, 1], s=100, color=c_end,
+                   marker="s", zorder=5, edgecolor="k", linewidth=0.6)
+
+        handles.append(plt.Line2D([0], [0], color=cmap_obj(0.6), lw=2.5,
+                                  label=label))
+
+    ax.autoscale_view()   # rescale axes to the LineCollections
+
+    ax.legend(handles=handles, fontsize=8, loc="best")
     ax.set_title(title, fontsize=10)
-    lbl = "t-SNE" if PROJ == "tsne" else "PCA"
-    ax.set_xlabel(f"{lbl}-1"); ax.set_ylabel(f"{lbl}-2")
-    ax.legend(fontsize=8, loc="best")
-    return sa
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
 
 
 def main():
     config = TrainConfig()
-    config.train.using_aug = False        # deterministic windows: no aug, no TR jitter
+    config.train.using_aug = False
 
     model = load_model(config)
 
-    print("[INFO] building full dataset (all subjects, all recordings)")
+    print("[INFO] building full dataset")
     ds = SimultEEG_fMRI(config)
 
-    subject, act_align, act_other, pid_align, pid_other = pick_recordings(ds)
+    subject, recordings = pick_subject(ds)
+    acts = sorted({a for _, a in recordings})
+    print(f"[INFO] subject={subject}  activities={acts}")
 
-    print("[INFO] encoding aligned recording (EEG + fMRI from same recording)")
+    act_align = ACT_ALIGN or acts[0]
+    act_other = ACT_OTHER or next((a for a in acts if a != act_align), None)
+    pid_align = next(pid for pid, a in recordings if a == act_align)
+    pid_other = next(pid for pid, a in recordings if a == act_other)
+
+    print(f"[INFO] encoding aligned:  {act_align}")
     ze_A, zf_A = encode_recording(model, ds, pid_align)
-    print("[INFO] encoding other-activity recording (for the fMRI mismatch)")
+    print(f"[INFO] encoding other:    {act_other}")
     _,    zf_B = encode_recording(model, ds, pid_other)
     print(f"[INFO] windows: aligned={len(ze_A)}  other={len(zf_B)}")
 
-    # per-window cosine similarity (embeddings are already L2-normalized by the projector)
     def cos(x, y):
         n = min(len(x), len(y))
         return (x[:n] * y[:n]).sum(1)
-    cos_aligned = cos(ze_A, zf_A)
+
+    cos_aligned  = cos(ze_A, zf_A)
     cos_mismatch = cos(ze_A, zf_B)
 
-    # ── figure ──────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 9))
-    gs = gridspec.GridSpec(2, 2, height_ratios=[2, 1], hspace=0.3, wspace=0.25)
+    # ── figure: 3 trajectory panels + cosine similarity ─────────────────────────
+    fig = plt.figure(figsize=(15, 9))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[2, 1], hspace=0.4, wspace=0.3)
 
+    # panel 1 — single EEG trajectory: how does the EEG embedding evolve over time?
     ax0 = fig.add_subplot(gs[0, 0])
-    plot_pca_traj(
-        ax0, ze_A, zf_A,
-        labels=[f"EEG  {act_align}", f"fMRI {act_align}"],
-        title=f"ALIGNED — {subject} / {act_align}\n(EEG & fMRI same recording)",
+    plot_traj_panel(
+        ax0,
+        [ze_A], [f"EEG  {act_align}"], ["Blues"],
+        f"(1) Single trajectory\n{subject} / {act_align} — EEG",
     )
+
+    # panel 2 — aligned: EEG and fMRI from the same recording
     ax1 = fig.add_subplot(gs[0, 1])
-    plot_pca_traj(
-        ax1, ze_A, zf_B,
-        labels=[f"EEG  {act_align}", f"fMRI {act_other}"],
-        title=f"NOT ALIGNED — {subject}\n(EEG {act_align} vs fMRI {act_other})",
+    plot_traj_panel(
+        ax1,
+        [ze_A, zf_A], [f"EEG  {act_align}", f"fMRI {act_align}"],
+        ["Blues", "Oranges"],
+        f"(2) Aligned\n{subject} / {act_align} — EEG & fMRI",
     )
 
-    ax2 = fig.add_subplot(gs[1, :])
-    ax2.plot(cos_aligned, color="tab:green", lw=1.4,
-             label=f"aligned (mean {cos_aligned.mean():+.3f})")
-    ax2.plot(cos_mismatch, color="tab:red", lw=1.4,
-             label=f"not aligned (mean {cos_mismatch.mean():+.3f})")
-    ax2.axhline(cos_aligned.mean(), color="tab:green", ls="--", lw=0.8)
-    ax2.axhline(cos_mismatch.mean(), color="tab:red", ls="--", lw=0.8)
-    ax2.axhline(0.0, color="0.6", lw=0.6)
-    ax2.set_xlabel("window index (TR order)")
-    ax2.set_ylabel("cos(EEG[t], fMRI[t])")
-    ax2.set_title("Per-window EEG↔fMRI cosine similarity", fontsize=10)
-    ax2.legend(fontsize=9)
+    # panel 3 — misaligned: EEG from one activity, fMRI from another
+    ax2 = fig.add_subplot(gs[0, 2])
+    plot_traj_panel(
+        ax2,
+        [ze_A, zf_B], [f"EEG  {act_align}", f"fMRI {act_other}"],
+        ["Blues", "Reds"],
+        f"(3) Misaligned\n{subject} — EEG:{act_align} / fMRI:{act_other}",
+    )
 
-    fig.suptitle("EEG / fMRI embedding trajectories — aligned vs not aligned", fontsize=13)
+    # bottom — per-window cosine similarity
+    ax_cos = fig.add_subplot(gs[1, :])
+    ax_cos.plot(cos_aligned, color="tab:green", lw=1.2,
+                label=f"aligned  EEG↔fMRI {act_align}"
+                      f"  (mean {cos_aligned.mean():+.3f})")
+    ax_cos.plot(cos_mismatch, color="tab:red", lw=1.2,
+                label=f"mismatch EEG {act_align} ↔ fMRI {act_other}"
+                      f"  (mean {cos_mismatch.mean():+.3f})")
+    ax_cos.axhline(cos_aligned.mean(),  color="tab:green", ls="--", lw=0.8)
+    ax_cos.axhline(cos_mismatch.mean(), color="tab:red",   ls="--", lw=0.8)
+    ax_cos.axhline(0.0, color="0.6", lw=0.6)
+    ax_cos.set_xlabel("window index (TR order)")
+    ax_cos.set_ylabel("cos(EEG[t], fMRI[t])")
+    ax_cos.set_title("Per-window cosine similarity — aligned vs mismatched", fontsize=10)
+    ax_cos.legend(fontsize=9)
+
+    fig.suptitle(f"EEG / fMRI embedding trajectories — {subject}", fontsize=13)
     fig.savefig(OUT_PATH, dpi=150, bbox_inches="tight")
     print(f"[INFO] saved {OUT_PATH}")
     print(f"[RESULT] mean cos  aligned={cos_aligned.mean():+.4f}  "
-          f"not-aligned={cos_mismatch.mean():+.4f}  "
+          f"mismatch={cos_mismatch.mean():+.4f}  "
           f"gap={cos_aligned.mean() - cos_mismatch.mean():+.4f}")
 
 
